@@ -289,7 +289,7 @@ index b7ffcce..5b1e84c 100644
  	};
  };
 diff --git a/private-include/indium/command-encoder.private.hpp b/private-include/indium/command-encoder.private.hpp
-index c3b1b93..3dab2ce 100644
+index c3b1b93..6b8783d 100644
 --- a/private-include/indium/command-encoder.private.hpp
 +++ b/private-include/indium/command-encoder.private.hpp
 @@ -1,6 +1,7 @@
@@ -300,7 +300,7 @@ index c3b1b93..3dab2ce 100644
  #include <memory>
  #include <optional>
  #include <array>
-@@ -17,117 +18,295 @@
+@@ -17,117 +18,330 @@
  
  #include <iridium/iridium.hpp>
  
@@ -529,6 +529,40 @@ index c3b1b93..3dab2ce 100644
 +	struct AddressPool {
 +		std::shared_ptr<Buffer> chunk;
 +		size_t used = 0;
++
++        // Two shader stages are live in the render encoder. Cache their small
++        // immutable tables in CPU memory, not in the GPU-mapped scratch chunk.
++        // This is only a read cache: misses retain the original byte comparison.
++        struct Shadow {
++            bool valid = false;
++            uint32_t offset;
++            VkDeviceSize range;
++            size_t count;
++            std::array<uint64_t, 64> addresses;
++        };
++        std::array<Shadow, 2> shadows;
++        size_t nextShadow = 0;
++
++        bool sameAddresses(uint32_t offset, VkDeviceSize range, const uint64_t* addresses, size_t count) const {
++            for (const auto& shadow : shadows) {
++                // A table's last eight bytes can be padding. If a new layout
++                // reads that padding, only the mapped bytes define the old key.
++                if (shadow.valid && shadow.offset == offset && shadow.range == range && count <= shadow.count)
++                    return !memcmp(shadow.addresses.data(), addresses, count * sizeof(uint64_t));
++            }
++            return !memcmp(static_cast<const char*>(chunk->contents()) + offset, addresses, count * sizeof(uint64_t));
++        }
++
++        void rememberAddresses(uint32_t offset, VkDeviceSize range, const uint64_t* addresses, size_t count) {
++            if (count > 64) return;
++            auto& shadow = shadows[nextShadow];
++            nextShadow = (nextShadow + 1) % shadows.size();
++            shadow.offset = offset;
++            shadow.range = range;
++            shadow.count = count;
++            memcpy(shadow.addresses.data(), addresses, count * sizeof(uint64_t));
++            shadow.valid = true;
++        }
 +	};
  
 -			if (functionResources.buffers.size() > 0) {
@@ -583,17 +617,18 @@ index c3b1b93..3dab2ce 100644
 +                if (bindingReuseEnabled() && previous && addressPool.chunk && previous->range == tableSize &&
 +                    previous->offset <= chunkSize && tableSize <= chunkSize - previous->offset &&
 +                    previous->buffer == static_cast<PrivateBuffer*>(addressPool.chunk.get())->buffer() &&
-+                    !memcmp(static_cast<const char*>(addressPool.chunk->contents()) + previous->offset,
-+                            addresses.data(), addresses.size() * sizeof(uint64_t)))
++                    addressPool.sameAddresses(previous->offset, previous->range, addresses.data(), addresses.size()))
 +                    return *previous;
 +				size_t tableOffset = (addressPool.used + alignment - 1) & ~(alignment - 1);
 +				if (!addressPool.chunk || tableOffset + tableSize > chunkSize) {
 +					addressPool.chunk = privateDevice->acquireScratchChunk();
++					for (auto& shadow : addressPool.shadows) shadow.valid = false;
 +					// we need to keep the chunk alive until the operation is completed
 +					keepAliveBuffers.push_back(addressPool.chunk);
 +					tableOffset = 0;
 +				}
 +				memcpy(static_cast<char*>(addressPool.chunk->contents()) + tableOffset, addresses.data(), addresses.size() * sizeof(uint64_t));
++                if (previous) addressPool.rememberAddresses(static_cast<uint32_t>(tableOffset), tableSize, addresses.data(), addresses.size());
 +				addressPool.used = tableOffset + tableSize;
 +				// plain pointer: a shared_ptr cast here was an atomic reference count round trip per stage per draw
 +				auto* privateAddressBuffer = static_cast<PrivateBuffer*>(addressPool.chunk.get());
@@ -654,7 +689,7 @@ index c3b1b93..3dab2ce 100644
  				descSet.descriptorCount = 1;
  				descSet.pBufferInfo = &info;
  			}
-@@ -136,17 +315,27 @@ namespace Indium {
+@@ -136,17 +350,27 @@ namespace Indium {
  				auto& bindingInfo = funcInfo.bindings[j];
  
  				if (bindingInfo.type == Iridium::BindingType::Texture) {
@@ -691,7 +726,7 @@ index c3b1b93..3dab2ce 100644
  					auto& descSet = writeDescSet.emplace_back();
  					descSet.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
  					descSet.dstSet = descriptorSets[i];
-@@ -156,19 +345,21 @@ namespace Indium {
+@@ -156,19 +380,21 @@ namespace Indium {
  					descSet.descriptorCount = 1;
  					descSet.pImageInfo = &info;
  				} else if (bindingInfo.type == Iridium::BindingType::Sampler) {
@@ -724,7 +759,7 @@ index c3b1b93..3dab2ce 100644
  					info.sampler = privateSampler->sampler();
  
  					auto& descSet = writeDescSet.emplace_back();
-@@ -188,10 +379,4 @@ namespace Indium {
+@@ -188,10 +414,4 @@ namespace Indium {
  		return descriptorSets;
  	};
  
