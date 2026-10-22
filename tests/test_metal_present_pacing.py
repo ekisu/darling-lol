@@ -1,6 +1,7 @@
 """Compile Indium's submit worker (as patched) with a host fixture: present pacing, bounded waits, mutation controls."""
 from pathlib import Path
 import shutil
+import resource
 import subprocess
 import tempfile
 import unittest
@@ -20,6 +21,11 @@ MUTANTS = {
                             's.idle.wait(lock, [&] { return s.completed >= target; }); const bool done = true;'),
 }
 
+
+
+def no_core_dump():
+    """Run in each fixture child: the mutation controls make it fail on purpose (abort), so it must not leave core dumps."""
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 def new_file(patch, path):
     """A file the patch creates, exactly as created."""
@@ -51,7 +57,7 @@ def build_and_run(folder, files, timeout=120):
     if build.returncode:
         return 'compile', build.stderr
     try:
-        run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=timeout)
+        run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=timeout, preexec_fn=no_core_dump)
     except subprocess.TimeoutExpired:
         return 'hang', ''
     return ('ok' if run.returncode == 0 else 'failed'), run.stdout + run.stderr

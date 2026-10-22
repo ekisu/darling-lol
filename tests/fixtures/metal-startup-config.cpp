@@ -1,6 +1,9 @@
 // Host checks of Indium's startup configuration helper (private-include/indium/startup-config.private.hpp, extracted from
 // patches/metal--deps--indium.patch): environment over guest file over default, "0"/empty handling, number parsing and
 // clamping, and that a call site resolves its value with exactly one lookup however often it runs.
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +35,10 @@ static bool siteFlag(const char* file) { static const bool value = flag("DARLING
 static long siteNumber(const char* file) { static const long value = number("DARLING_METAL_TEST_NUMBER", file, 500, 500, 100000); return value; }
 
 int main() {
+#ifdef __linux__
+	// The mutation controls make this fixture fail on purpose (abort): no core dump, no crash report.
+	prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
 	char templ[] = "/tmp/metal-startup-config-XXXXXX";
 	CHECK(mkdtemp(templ));
 	dir = templ;

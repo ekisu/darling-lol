@@ -3,6 +3,9 @@
 // the presentation engine; the engine keeps the last presented image until a newer one arrives (flip-like) and
 // releases older ones; acquire is non-blocking and fails with NotReady when no image is free; present fences signal
 // some time after the present; host access to the swapchain must never be concurrent (checked).
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include "CAMetalDirectPresent.h"
 
 #include <atomic>
@@ -461,6 +464,10 @@ static void testRevokeWhilePolling() {
 }
 
 int main(int argc, char** argv) {
+#ifdef __linux__
+	// The mutation controls make this fixture fail on purpose (abort): no core dump, no crash report.
+	prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
 	testRevokeWhilePolling();
 	testSlowEngine();
 	testBasic();

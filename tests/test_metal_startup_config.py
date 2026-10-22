@@ -2,6 +2,7 @@
 from pathlib import Path
 import re
 import shutil
+import resource
 import subprocess
 import tempfile
 import unittest
@@ -40,6 +41,11 @@ MUTANTS = {
 }
 
 
+
+def no_core_dump():
+    """Run in each fixture child: the mutation controls make it fail on purpose (abort), so it must not leave core dumps."""
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
 def postimage(patch):
     """{path: [postimage lines of the patch's hunks]}, i.e. context and added lines per file section."""
     files = {}
@@ -72,7 +78,7 @@ def build_and_run(folder, header, timeout=60):
                            capture_output=True, text=True)
     if build.returncode:
         return 'compile', build.stderr
-    run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=timeout)
+    run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=timeout, preexec_fn=no_core_dump)
     return ('ok' if run.returncode == 0 else 'failed'), run.stdout + run.stderr
 
 
@@ -193,7 +199,7 @@ class DirectActivationChecks(unittest.TestCase):
             (folder / name).write_text('')
         environment = {k: v for k, v in __import__('os').environ.items() if not k.startswith('DARLING_METAL_')}
         environment.update(env or {})
-        out = subprocess.run([str(binary)], env=environment, capture_output=True, text=True, timeout=30)
+        out = subprocess.run([str(binary)], env=environment, capture_output=True, text=True, timeout=30, preexec_fn=no_core_dump)
         self.assertEqual(out.returncode, 0, out.stderr)
         return tuple(int(x) for x in out.stdout.split())
 

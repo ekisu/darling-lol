@@ -1,6 +1,7 @@
 """Compile the shipped direct-presentation core against a fake WSI, and check that the fixture catches broken variants."""
 from pathlib import Path
 import shutil
+import resource
 import subprocess
 import tempfile
 import unittest
@@ -30,6 +31,11 @@ MUTANTS = {
 }
 
 
+
+def no_core_dump():
+    """Run in each fixture child: the mutation controls make it fail on purpose (abort), so it must not leave core dumps."""
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
 def presenter_header():
     """The new header exactly as the patch creates it."""
     patch = (ROOT / 'patches/cocotron.patch').read_text()
@@ -53,7 +59,7 @@ def build_and_run(folder, header, iterations='2', timeout=120):
     if build.returncode:
         return 'compile', build.stderr
     try:
-        run = subprocess.run([str(binary), iterations], capture_output=True, text=True, timeout=timeout)
+        run = subprocess.run([str(binary), iterations], capture_output=True, text=True, timeout=timeout, preexec_fn=no_core_dump)
     except subprocess.TimeoutExpired:
         return 'hang', ''
     return ('ok' if run.returncode == 0 else 'failed'), run.stdout + run.stderr

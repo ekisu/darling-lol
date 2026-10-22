@@ -1,6 +1,9 @@
 // Host checks of Indium's submit worker pacing (private-include/indium/submit-thread.private.hpp, extracted from
 // patches/metal--deps--indium.patch): post() sequence numbers, waitFor() not extended by later tasks, postPaced()
 // keeping a committing thread at most one presenting task ahead of the worker, and drainFor() bounded at exit.
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <indium/submit-thread.private.hpp>
 
 #include <atomic>
@@ -114,6 +117,10 @@ static void testDrainForIsBounded() {
 }
 
 int main() {
+#ifdef __linux__
+	// The mutation controls make this fixture fail on purpose (abort): no core dump, no crash report.
+	prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
 	ST::ensureStarted();
 	testSequenceAndOrder();
 	testWaitForIgnoresLaterTasks();
