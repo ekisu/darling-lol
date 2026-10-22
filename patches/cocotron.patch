@@ -10535,7 +10535,7 @@ index d6f86b31..a402137a 100644
  
  static void glDebugCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, const void* context) {
 diff --git a/QuartzCore/CAMetalLayer.mm b/QuartzCore/CAMetalLayer.mm
-index b81e2e14..887ff228 100644
+index b81e2e14..3b778ff0 100644
 --- a/QuartzCore/CAMetalLayer.mm
 +++ b/QuartzCore/CAMetalLayer.mm
 @@ -25,7 +25,90 @@
@@ -10971,7 +10971,7 @@ index b81e2e14..887ff228 100644
 +}
 +
 +//
-+// darling-lol: direct presentation prototype (guest flag /tmp/metal-direct-present)
++// darling-lol: direct presentation prototype (DARLING_METAL_DIRECT_PRESENT or guest flag /tmp/metal-direct-present)
 +//
 +// The layer presents through a Vulkan swapchain on its context's X11 window when it is the context's root layer,
 +// fills the window exactly (drawable size = window size) and nothing else would be composited. Only the main thread
@@ -13416,7 +13416,7 @@ index 00000000..e6e76366
 +#endif
 diff --git a/QuartzCore/CAMetalDirectSupport.h b/QuartzCore/CAMetalDirectSupport.h
 new file mode 100644
-index 00000000..2a75f30f
+index 00000000..cd68baff
 --- /dev/null
 +++ b/QuartzCore/CAMetalDirectSupport.h
 @@ -0,0 +1,73 @@
@@ -13455,7 +13455,7 @@ index 00000000..2a75f30f
 +
 +class CAMetalDirectLayerState;
 +
-+// Indium::directPresentationRequested(): guest flag /tmp/metal-direct-present (or a default-on libindium).
++// Indium::directPresentationRequested(): DARLING_METAL_DIRECT_PRESENT, else guest flag /tmp/metal-direct-present (or a default-on libindium).
 +bool CAMetalDirectEnabled();
 +// The present-request sampler of -[CAMetalLayer queuePresent:] (opt-in capture), for the direct path's requests.
 +void* CAMetalPresentIntervalBegin();
@@ -13494,7 +13494,7 @@ index 00000000..2a75f30f
 +
 +#endif
 diff --git a/QuartzCore/CAMetalLayerInternal.h b/QuartzCore/CAMetalLayerInternal.h
-index 48693da0..09d78089 100644
+index 48693da0..f35c192b 100644
 --- a/QuartzCore/CAMetalLayerInternal.h
 +++ b/QuartzCore/CAMetalLayerInternal.h
 @@ -23,8 +23,10 @@
@@ -13513,7 +13513,7 @@ index 48693da0..09d78089 100644
  
  	GLuint _tex;
 +
-+	// darling-lol (direct presentation prototype, guest flag /tmp/metal-direct-present)
++	// darling-lol (direct presentation prototype, DARLING_METAL_DIRECT_PRESENT or guest flag /tmp/metal-direct-present)
 +	std::shared_ptr<CAMetalDirectLayerState> _direct;
 +	std::atomic<bool> _directDriveScheduled;
 +	CFTimeInterval _directActivationStart;

@@ -59,6 +59,24 @@ int main() {
 	accessCalls = 0;
 	CHECK(flag("DARLING_METAL_TEST", flagFile.c_str()) && accessCalls == 0);
 
+	// activation with a build default and the former on/off guest files
+	unsetenv("DARLING_METAL_ACT");
+	const std::string on = path("on"), off = path("off");
+	CHECK(!activation("DARLING_METAL_ACT", false, on.c_str(), off.c_str()));
+	CHECK(activation("DARLING_METAL_ACT", true, on.c_str(), off.c_str()));
+	write("on", "");
+	write("off", "");
+	CHECK(activation("DARLING_METAL_ACT", false, on.c_str(), off.c_str())); // default off: the on file enables
+	CHECK(!activation("DARLING_METAL_ACT", true, on.c_str(), off.c_str())); // default on: the off file disables
+	setenv("DARLING_METAL_ACT", "1", 1);
+	CHECK(activation("DARLING_METAL_ACT", true, on.c_str(), off.c_str()));
+	setenv("DARLING_METAL_ACT", "0", 1);
+	CHECK(!activation("DARLING_METAL_ACT", false, on.c_str(), off.c_str()));
+	setenv("DARLING_METAL_ACT", "", 1);
+	CHECK(activation("DARLING_METAL_ACT", false, on.c_str(), off.c_str()));
+	unlink(on.c_str());
+	unlink(off.c_str());
+
 	// numbers: default, file, environment, clamping, rejection without clamp, invalid text
 	unsetenv("DARLING_METAL_N");
 	CHECK(number("DARLING_METAL_N", missing.c_str(), 16, 1, 256) == 16);

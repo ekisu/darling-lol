@@ -816,7 +816,7 @@ index 8546daa..7e4993c 100644
  		void updateBindings();
  
 diff --git a/private-include/indium/device.private.hpp b/private-include/indium/device.private.hpp
-index 58f1794..4decf8c 100644
+index 58f1794..059fa4f 100644
 --- a/private-include/indium/device.private.hpp
 +++ b/private-include/indium/device.private.hpp
 @@ -13,6 +13,8 @@
@@ -845,7 +845,7 @@ index 58f1794..4decf8c 100644
  			ExternalSemaphoreFD = 1 << 2,
  			NonSemanticInfo     = 1 << 3,
 +			// darling-lol: VK_EXT_swapchain_maintenance1 with its feature enabled (only requested for direct
-+			// presentation, guest flag /tmp/metal-direct-present)
++			// presentation, see directPresentationRequested)
 +			SwapchainMaintenance1 = 1 << 4,
  		};
  
@@ -3734,10 +3734,15 @@ index a4677c3..69ef23f 100644
  	libraryHandle = _elfcalls->dlopen("libvulkan.so.1");
  #else
 diff --git a/src/indium/indium.cpp b/src/indium/indium.cpp
-index e7c06fe..57ed61d 100644
+index e7c06fe..7c6b617 100644
 --- a/src/indium/indium.cpp
 +++ b/src/indium/indium.cpp
-@@ -5,20 +5,62 @@
+@@ -1,24 +1,71 @@
+ #include <indium/instance.private.hpp>
+ #include <indium/device.private.hpp>
+ #include <indium/dynamic-vk.hpp>
++#include <indium/startup-config.private.hpp>
+ 
  #include <iridium/iridium.hpp>
  
  #include <unordered_set>
@@ -3758,19 +3763,23 @@ index e7c06fe..57ed61d 100644
 +
 +bool Indium::directPresentationRequested() {
 +#ifdef INDIUM_DIRECT_PRESENT_DEFAULT_ON
-+	static const bool requested = access("/tmp/metal-no-direct-present", F_OK) != 0;
++	constexpr bool defaultOn = true;
 +#else
-+	static const bool requested = access("/tmp/metal-direct-present", F_OK) == 0;
++	constexpr bool defaultOn = false;
 +#endif
++	static const bool requested = StartupConfig::activation("DARLING_METAL_DIRECT_PRESENT", defaultOn,
++		"/tmp/metal-direct-present", "/tmp/metal-no-direct-present");
 +	return requested;
 +}
 +
 +bool Indium::directAsyncCommitRequested() {
 +#ifdef INDIUM_DIRECT_ASYNC_COMMIT_DEFAULT_ON
-+	static const bool requested = access("/tmp/metal-no-direct-async-commit", F_OK) != 0;
++	constexpr bool defaultOn = true;
 +#else
-+	static const bool requested = access("/tmp/metal-direct-async-commit", F_OK) == 0;
++	constexpr bool defaultOn = false;
 +#endif
++	static const bool requested = StartupConfig::activation("DARLING_METAL_DIRECT_ASYNC_COMMIT", defaultOn,
++		"/tmp/metal-direct-async-commit", "/tmp/metal-no-direct-async-commit");
 +	return requested;
 +}
 +
@@ -3801,7 +3810,7 @@ index e7c06fe..57ed61d 100644
  
  	if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
  		// convenient breakpoint
-@@ -43,6 +85,11 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
+@@ -43,6 +90,11 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
  		VK_KHR_SURFACE_EXTENSION_NAME,
  	};
  
@@ -3813,7 +3822,7 @@ index e7c06fe..57ed61d 100644
  	uint32_t count;
  
  	std::vector<VkLayerProperties> layerProps;
-@@ -68,8 +115,33 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
+@@ -68,8 +120,33 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
  		extensionSet.insert(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
  	}
  
@@ -3829,7 +3838,7 @@ index e7c06fe..57ed61d 100644
 +		enumerate(nullptr, &extensionCount, instanceExtensions.data());
 +		instanceExtensions.resize(extensionCount);
 +	}
-+	// darling-lol: direct presentation (guest flag /tmp/metal-direct-present) presents CAMetalLayer drawables through a
++	// darling-lol: direct presentation (DARLING_METAL_DIRECT_PRESENT or guest flag /tmp/metal-direct-present) presents CAMetalLayer drawables through a
 +	// swapchain on the layer's X11 window; the surface extension is only requested then, and only if available.
 +	std::vector<const char*> requested(additionalExtensions, additionalExtensions + additionalExtensionCount);
 +	if (directPresentationRequested()) {
@@ -3849,7 +3858,7 @@ index e7c06fe..57ed61d 100644
  	}
  
  	std::vector<const char*> extensions(extensionSet.begin(), extensionSet.end());
-@@ -97,13 +169,13 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
+@@ -97,13 +174,13 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
  
  	VkValidationFeaturesEXT valFeat {};
  	std::vector<VkValidationFeatureEnableEXT> valFeatures {
@@ -3865,7 +3874,7 @@ index e7c06fe..57ed61d 100644
  		createInfo.pNext = &valFeat;
  	}
  
-@@ -112,6 +184,7 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
+@@ -112,6 +189,7 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
  		// TODO: maybe warn?
  		return;
  	}
@@ -3873,7 +3882,7 @@ index e7c06fe..57ed61d 100644
  
  	if (!DynamicVK::eagerlyResolveRequired()) {
  		// TODO: maybe warn?
-@@ -133,7 +206,10 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
+@@ -133,7 +211,10 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
  	initGlobalDeviceList();
  };
  
@@ -3884,7 +3893,7 @@ index e7c06fe..57ed61d 100644
  	finitGlobalDeviceList();
  
  	if (debugMessenger && DynamicVK::vkDestroyDebugUtilsMessengerEXT) {
-@@ -146,4 +222,5 @@ void Indium::finit() {
+@@ -146,4 +227,5 @@ void Indium::finit() {
  	DynamicVK::finit();
  
  	Iridium::finit();
@@ -9235,23 +9244,24 @@ index 0000000..d251854
 +	};
 +};
 diff --git a/private-include/indium/instance.private.hpp b/private-include/indium/instance.private.hpp
-index 62d0283..45fb91f 100644
+index 62d0283..d0ecd40 100644
 --- a/private-include/indium/instance.private.hpp
 +++ b/private-include/indium/instance.private.hpp
-@@ -4,4 +4,15 @@
+@@ -4,4 +4,16 @@
  
  namespace Indium {
  	extern VkInstance globalInstance;
 +	// darling-lol: whether the global instance was created with this (optional) extension enabled.
 +	bool instanceExtensionEnabled(const char* name);
-+	// darling-lol (direct presentation prototype): whether CAMetalLayer presents through a Vulkan swapchain. Guest
-+	// flag /tmp/metal-direct-present; a build with INDIUM_DIRECT_PRESENT_DEFAULT_ON enables it unless
-+	// /tmp/metal-no-direct-present exists (an A/B arm that differs only in libindium). Read once per process.
++	// darling-lol (direct presentation): whether CAMetalLayer presents through a Vulkan swapchain. Environment
++	// DARLING_METAL_DIRECT_PRESENT (non-empty: "0" off, anything else on; tools/run-riot-client.sh sets 1); without it the
++	// guest flag /tmp/metal-direct-present, or in a build with INDIUM_DIRECT_PRESENT_DEFAULT_ON on unless
++	// /tmp/metal-no-direct-present exists. Read once per process.
 +	bool directPresentationRequested();
 +	// darling-lol (direct presentation): whether a presenting commit whose drawables all present independently skips
-+	// the frame-end drain and is paced one presenting frame behind instead. Guest flag /tmp/metal-direct-async-commit; a
-+	// build with INDIUM_DIRECT_ASYNC_COMMIT_DEFAULT_ON enables it unless /tmp/metal-no-direct-async-commit exists. Read
-+	// once per process.
++	// the frame-end drain and is paced one presenting frame behind instead. Environment DARLING_METAL_DIRECT_ASYNC_COMMIT
++	// (like DARLING_METAL_DIRECT_PRESENT; the launcher sets 1); without it the guest flag /tmp/metal-direct-async-commit,
++	// or with INDIUM_DIRECT_ASYNC_COMMIT_DEFAULT_ON on unless /tmp/metal-no-direct-async-commit exists. Once per process.
 +	bool directAsyncCommitRequested();
  };
 diff --git a/include/indium/drawable.hpp b/include/indium/drawable.hpp
@@ -9272,10 +9282,10 @@ index f9f717f..ecf515f 100644
  };
 diff --git a/private-include/indium/startup-config.private.hpp b/private-include/indium/startup-config.private.hpp
 new file mode 100644
-index 0000000..63aed31
+index 0000000..87ebf3f
 --- /dev/null
 +++ b/private-include/indium/startup-config.private.hpp
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,82 @@
 +#pragma once
 +
 +// darling-lol: startup configuration of the Metal/Indium/QuartzCore switches that used to be re-read from guest flag
@@ -9306,10 +9316,26 @@ index 0000000..63aed31
 +			return value && *value ? value : nullptr;
 +		}
 +
++		// The environment as a switch: -1 when unset or empty, 0 for exactly "0", 1 for anything else.
++		INDIUM_STARTUP_CONFIG_LOCAL inline int environmentSwitch(const char* name) {
++			const char* value = environment(name);
++			if (!value) return -1;
++			return value[0] == '0' && value[1] == '\0' ? 0 : 1;
++		}
++
 +		// On/off switch: environment variable, else whether the guest file exists, else false.
 +		INDIUM_STARTUP_CONFIG_LOCAL inline bool flag(const char* name, const char* file) {
-+			if (const char* value = environment(name)) return !(value[0] == '0' && value[1] == '\0');
++			if (const int value = environmentSwitch(name); value >= 0) return value == 1;
 +			return file && access(file, F_OK) == 0;
++		}
++
++		// Feature activation with a build default: the environment variable when set and non-empty ("0" off, anything else
++		// on); otherwise, with the default on, off only if `offFile` exists, and with the default off, on only if `onFile`
++		// exists (the former guest flag files).
++		INDIUM_STARTUP_CONFIG_LOCAL inline bool activation(const char* name, bool defaultOn, const char* onFile, const char* offFile) {
++			if (const int value = environmentSwitch(name); value >= 0) return value == 1;
++			if (defaultOn) return !(offFile && access(offFile, F_OK) == 0);
++			return onFile && access(onFile, F_OK) == 0;
 +		}
 +
 +		// Whole decimal number, clamped to [low, high] (or, without `clamp`, rejected outside it); false when unusable.

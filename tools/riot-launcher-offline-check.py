@@ -37,7 +37,8 @@ if record["command"] == "darling":
     record["fds"] = sorted(fd for fd in map(int, os.listdir("/proc/self/fd")) if is_open(fd))
     record["flags"] = {{key: os.environ.get(key) for key in
         ("RCLOL_APP_ARG3", "RCLOL_APP_ARG3_SLOT", "RCLOL_UX_ARG2", "RCLOL_UX_ARG2_SLOT", "RCLOL_UX_ARG1", "RCLOL_APP_ARGS", "RCLOL_APP_ARG2", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DARLING_XSHM_LIBRARY",
-         "WAYLAND_DISPLAY", "XAUTHORITY", "DRI_PRIME", "MESA_NO_ERROR", "__GL_THREADED_OPTIMIZATIONS", "SHELL")}}
+         "WAYLAND_DISPLAY", "XAUTHORITY", "DRI_PRIME", "MESA_NO_ERROR", "__GL_THREADED_OPTIMIZATIONS", "SHELL",
+         "DARLING_METAL_DIRECT_PRESENT", "DARLING_METAL_DIRECT_ASYNC_COMMIT")}}
 with open({str(log)!r}, "a") as output:
     output.write(json.dumps(record) + "\\n")
 '''
@@ -53,6 +54,8 @@ with open({str(log)!r}, "a") as output:
         (prefix / "Applications/Riot Client.app").mkdir(parents=True)
         env["DPREFIX"] = str(prefix)
         env.pop("RIOT_GUEST_HOME", None)
+        env.pop("DARLING_METAL_DIRECT_PRESENT", None)
+        env.pop("DARLING_METAL_DIRECT_ASYNC_COMMIT", None)
         (folder / "runtime-paths.sh").write_text(
             (ROOT / "tools/runtime-paths.sh").read_text()
             .replace("@DPREFIX@", str(prefix)).replace("@GUEST_HOME@", "/Users/offline-check"))
@@ -102,6 +105,8 @@ with open({str(log)!r}, "a") as output:
             "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DARLING_XSHM_LIBRARY"
         )), "Darling runtime overrides lost"
         assert "--launch-product=league_of_legends" in launch["args"], "product launch lost"
+        assert (launch["flags"]["DARLING_METAL_DIRECT_PRESENT"], launch["flags"]["DARLING_METAL_DIRECT_ASYNC_COMMIT"]) == ("1", "1"), \
+            "direct presentation and paced commits not on by default"
         assert "--app-root=/Applications/Riot Client.app" in launch["args"], "application root lost"
         assert "--log-dir=/Users/offline-check/Library/Logs/Riot Games/Riot Client" in launch["args"], "absolute log directory lost"
         # An inherited injection must also be absent for first-time installation.
@@ -127,7 +132,20 @@ with open({str(log)!r}, "a") as output:
         assert filtered["WAYLAND_DISPLAY"] is None and filtered["SHELL"] == "/bin/zsh", "host session metadata survived"
         assert (filtered["XAUTHORITY"], filtered["DRI_PRIME"]) == ("/tmp/xauth", "1"), "X11/GPU selection lost"
         assert (filtered["MESA_NO_ERROR"], filtered["__GL_THREADED_OPTIMIZATIONS"]) == ("1", "0"), "launcher GPU tuning lost"
-        print("LAUNCHER_OFFLINE pass=1 installed=PASS installer=PASS inherited_injection=absent runtime=preserved inherited_fds=closed host_env_filter=PASS")
+        # Each switch can be turned off by an explicit 0 or an empty value, which reaches the guest as 0.
+        env.pop("RCLOL_FILTER_HOST_ENV")
+        for present, paced, expected in (("0", None, ("0", "1")), ("", None, ("0", "1")), (None, "0", ("1", "0")),
+                                         (None, "", ("1", "0")), ("0", "0", ("0", "0")), ("1", "1", ("1", "1"))):
+            for key, value in (("DARLING_METAL_DIRECT_PRESENT", present), ("DARLING_METAL_DIRECT_ASYNC_COMMIT", paced)):
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
+            subprocess.run(["sh", str(launcher)], env=env, check=True, capture_output=True, text=True)
+            flags = json.loads(log.read_text().splitlines()[-1])["flags"]
+            got = (flags["DARLING_METAL_DIRECT_PRESENT"], flags["DARLING_METAL_DIRECT_ASYNC_COMMIT"])
+            assert got == expected, f"direct switches {present!r}/{paced!r} gave {got}"
+        print("LAUNCHER_OFFLINE pass=1 direct_present=default_on,off_override installed=PASS installer=PASS inherited_injection=absent runtime=preserved inherited_fds=closed host_env_filter=PASS")
 
 
 if __name__ == "__main__":

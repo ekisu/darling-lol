@@ -29,12 +29,14 @@ CONVERTED = {
 }
 
 MUTANTS = {
-    'zero-means-on': ("return !(value[0] == '0' && value[1] == '\\0');", 'return true;'),
+    'zero-means-on': ("return value[0] == '0' && value[1] == '\\0' ? 0 : 1;", 'return 1;'),
     'empty-env-wins': ('return value && *value ? value : nullptr;', 'return value;'),
     'no-clamp': ('out = value < low ? low : value > high ? high : value;', 'out = value;'),
     'out-of-range-accepted': ('if (!clamp && (value < low || value > high)) return false;', ''),
     'overflow-accepted': ('if (end == text || errno != 0) return false;', 'if (end == text) return false;'),
     'trailing-junk-accepted': ("if (*end != '\\0') return false;", ''),
+    'activation-on-ignores-off-file': ('if (defaultOn) return !(offFile && access(offFile, F_OK) == 0);', 'if (defaultOn) return true;'),
+    'activation-off-ignores-on-file': ('return onFile && access(onFile, F_OK) == 0;', 'return false;'),
 }
 
 
@@ -156,3 +158,75 @@ class HelperChecks(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+ACTIVATION_DRIVER = r'''
+#include <cstdio>
+#include <indium/startup-config.private.hpp>
+namespace Indium { bool directPresentationRequested(); bool directAsyncCommitRequested(); }
+/* ACTUAL_PATCHED_ACTIVATION */
+int main() { printf("%d %d\n", (int) Indium::directPresentationRequested(), (int) Indium::directAsyncCommitRequested()); return 0; }
+'''
+
+
+def activation_source(patch, folder):
+    """The two activation functions exactly as patched into indium.cpp, with their guest files moved to `folder`."""
+    lines = postimage(patch)['src/indium/indium.cpp']
+    text = '\n'.join(lines)
+    start = text.index('bool Indium::directPresentationRequested() {')
+    end = text.index('\n}\n', text.index('bool Indium::directAsyncCommitRequested() {')) + 3
+    region = text[start:end]
+    for name in ('metal-direct-present', 'metal-no-direct-present', 'metal-direct-async-commit', 'metal-no-direct-async-commit'):
+        assert region.count(f'"/tmp/{name}"') == 1, name
+        region = region.replace(f'"/tmp/{name}"', f'"{folder}/{name}"')
+    return region
+
+
+@unittest.skipUnless(shutil.which('c++'), 'C++ compiler required')
+class DirectActivationChecks(unittest.TestCase):
+    """DARLING_METAL_DIRECT_PRESENT / DARLING_METAL_DIRECT_ASYNC_COMMIT over the guest files and the build defaults."""
+
+    def run_case(self, binary, folder, env=None, files=()):
+        for name in ('metal-direct-present', 'metal-no-direct-present', 'metal-direct-async-commit', 'metal-no-direct-async-commit'):
+            (folder / name).unlink(missing_ok=True)
+        for name in files:
+            (folder / name).write_text('')
+        environment = {k: v for k, v in __import__('os').environ.items() if not k.startswith('DARLING_METAL_')}
+        environment.update(env or {})
+        out = subprocess.run([str(binary)], env=environment, capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return tuple(int(x) for x in out.stdout.split())
+
+    def test_environment_files_and_build_defaults(self):
+        header = new_file((ROOT / 'patches/metal--deps--indium.patch').read_text(), HEADER)
+        patch = (ROOT / 'patches/metal--deps--indium.patch').read_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / 'include/indium').mkdir(parents=True)
+            (folder / 'include/indium/startup-config.private.hpp').write_text(header)
+            (folder / 'main.cpp').write_text(ACTIVATION_DRIVER.replace('/* ACTUAL_PATCHED_ACTIVATION */', activation_source(patch, folder)))
+            binaries = {}
+            for build, defines in (('off', []), ('on', ['-DINDIUM_DIRECT_PRESENT_DEFAULT_ON=1', '-DINDIUM_DIRECT_ASYNC_COMMIT_DEFAULT_ON=1'])):
+                binaries[build] = folder / ('check-' + build)
+                built = subprocess.run(['c++', '-std=c++17', *defines, '-I', str(folder / 'include'), str(folder / 'main.cpp'),
+                                        '-o', str(binaries[build])], capture_output=True, text=True)
+                self.assertEqual(built.returncode, 0, built.stderr)
+            P, A = 'DARLING_METAL_DIRECT_PRESENT', 'DARLING_METAL_DIRECT_ASYNC_COMMIT'
+            cases = [
+                # ordinary build (default off): what tools/run-riot-client.sh enables with 1 and turns off with 0
+                ('off', {}, (), (0, 0)),
+                ('off', {P: '1', A: '1'}, (), (1, 1)),
+                ('off', {P: '1', A: '0'}, (), (1, 0)),
+                ('off', {P: '0', A: '0'}, ('metal-direct-present', 'metal-direct-async-commit'), (0, 0)),
+                ('off', {P: '', A: ''}, ('metal-direct-present',), (1, 0)),
+                ('off', {}, ('metal-direct-present', 'metal-direct-async-commit'), (1, 1)),
+                # default-on benchmark build
+                ('on', {}, (), (1, 1)),
+                ('on', {P: '0', A: '0'}, (), (0, 0)),
+                ('on', {}, ('metal-no-direct-present',), (0, 1)),
+                ('on', {P: '1'}, ('metal-no-direct-present', 'metal-no-direct-async-commit'), (1, 0)),
+                ('on', {P: ''}, ('metal-no-direct-present',), (0, 1)),
+            ]
+            for build, env, files, expected in cases:
+                with self.subTest(build=build, env=env, files=files):
+                    self.assertEqual(self.run_case(binaries[build], folder, env, files), expected)

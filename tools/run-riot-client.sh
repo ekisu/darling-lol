@@ -42,6 +42,13 @@ for option in RCLOL_GPU_DIRECT_PRESENT RCLOL_GPU_DIRECT_ASYNC RCLOL_GPU_DIRECT_V
  eval 'value=${'"$option"'-1}'
  case "$value" in 0|'') unset "$option";; *) export "$option=$value";; esac
 done
+# Direct Vulkan presentation of Metal layers and paced (async) frame-end commits; the game inherits both from the
+# client. On by default; explicit 0 or an empty value turns one off. Off is exported as 0, not unset, so it also wins
+# over a libindium built with the default on. Async pacing only applies to directly presented frames.
+for option in DARLING_METAL_DIRECT_PRESENT DARLING_METAL_DIRECT_ASYNC_COMMIT; do
+ eval 'value=${'"$option"'-1}'
+ case "$value" in 0|'') export "$option=0";; *) export "$option=$value";; esac
+done
 prefix=$prefix_dir
 # RIOT_GUEST_HOME is host-side; DYLD paths must be relative to the guest root.
 case "$guest_home" in
