@@ -18,13 +18,19 @@ resource_include = subprocess.check_output(['clang++', '-print-resource-dir'], t
 for key in ('C_INCLUDES', 'CXX_INCLUDES'):
     flags[key] = [resource_include if value.startswith('/usr/lib/clang/') and value.endswith('/include') else value for value in flags[key]]
 link = shlex.split((folder / 'CMakeFiles/QuartzCore.dir/link.txt').read_text())
-for name, suffix in [('CALayer', 'm'), ('CALayerContext', 'm'), ('CATransaction', 'm'), ('CAMetalLayer', 'mm'), ('CAMetalDrawable', 'mm')]:
+for name, suffix in [('CALayer', 'm'), ('CALayerContext', 'm'), ('CATransaction', 'm'), ('CAMetalLayer', 'mm'), ('CAMetalDrawable', 'mm'),
+                     ('CAMetalDirectPresent', 'mm')]:
     kind = 'CXX' if suffix == 'mm' else 'C'
     obj = root / f'build/riot-quartzcore-{name}.o'
     subprocess.run(['clang++' if kind == 'CXX' else 'clang', *flags[kind + '_DEFINES'],
                     *flags[kind + '_INCLUDES'], *flags[kind + '_FLAGS'], '-O2',
                     '-Wno-macro-redefined', '-c', str(source / (name + '.' + suffix)), '-o', str(obj)], check=True)
-    link[link.index('CMakeFiles/QuartzCore.dir/' + name + '.' + suffix + '.o')] = str(obj)
+    target = 'CMakeFiles/QuartzCore.dir/' + name + '.' + suffix + '.o'
+    # A build tree configured before the source was added does not list it yet.
+    if target in link:
+        link[link.index(target)] = str(obj)
+    else:
+        link.insert(link.index('-o'), str(obj))
 link[link.index('-o') + 1] = str(root / 'build/riot-QuartzCore')
 subprocess.run(link, cwd=folder, check=True)
 for name in ('riot-metal-presentation-check', 'riot-ca-render-policy-check'):

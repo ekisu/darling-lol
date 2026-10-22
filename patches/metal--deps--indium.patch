@@ -816,7 +816,7 @@ index 8546daa..7e4993c 100644
  		void updateBindings();
  
 diff --git a/private-include/indium/device.private.hpp b/private-include/indium/device.private.hpp
-index 58f1794..75266fd 100644
+index 58f1794..4decf8c 100644
 --- a/private-include/indium/device.private.hpp
 +++ b/private-include/indium/device.private.hpp
 @@ -13,6 +13,8 @@
@@ -840,7 +840,17 @@ index 58f1794..75266fd 100644
  
  		// these are stored separately (rather than in a single structure)
  		// so that we can easily copy them individually in the event loop polling function.
-@@ -59,6 +64,8 @@ namespace Indium {
+@@ -44,6 +49,9 @@ namespace Indium {
+ 			ExternalMemoryFD    = 1 << 1,
+ 			ExternalSemaphoreFD = 1 << 2,
+ 			NonSemanticInfo     = 1 << 3,
++			// darling-lol: VK_EXT_swapchain_maintenance1 with its feature enabled (only requested for direct
++			// presentation, guest flag /tmp/metal-direct-present)
++			SwapchainMaintenance1 = 1 << 4,
+ 		};
+ 
+ 		friend inline Feature operator|(Feature lhs, Feature rhs) {
+@@ -59,6 +67,8 @@ namespace Indium {
  		}
  
  		virtual std::string name() const override;
@@ -849,7 +859,7 @@ index 58f1794..75266fd 100644
  		virtual std::shared_ptr<CommandQueue> newCommandQueue() override;
  		virtual std::shared_ptr<RenderPipelineState> newRenderPipelineState(const RenderPipelineDescriptor& descriptor) override;
  		virtual std::shared_ptr<ComputePipelineState> newComputePipelineState(const ComputePipelineDescriptor& descriptor, PipelineOption options, std::shared_ptr<ComputePipelineReflection> reflection) override;
-@@ -73,6 +80,12 @@ namespace Indium {
+@@ -73,6 +83,12 @@ namespace Indium {
  		virtual void pollEvents(uint64_t timeoutNanoseconds) override;
  		virtual void wakeupEventLoop() override;
  
@@ -862,7 +872,7 @@ index 58f1794..75266fd 100644
  		void waitForSemaphore(VkSemaphore semaphore, uint64_t targetValue, std::function<void()> callback);
  
  		/**
-@@ -86,6 +99,11 @@ namespace Indium {
+@@ -86,6 +102,11 @@ namespace Indium {
  		 * Similar to getTimelineSemaphore(), but wraps it in a shared pointer
  		 * that automatically releases the semaphore when all references to it die out.
  		 */
@@ -874,7 +884,7 @@ index 58f1794..75266fd 100644
  		std::shared_ptr<TimelineSemaphore> getWrappedTimelineSemaphore();
  
  		BinarySemaphore getBinarySemaphore(bool exportable = false);
-@@ -111,5 +129,37 @@ namespace Indium {
+@@ -111,5 +132,37 @@ namespace Indium {
  
  		INDIUM_PROPERTY(VkPhysicalDeviceMemoryProperties, m, M,emoryProperties);
  		INDIUM_PROPERTY_READONLY(Feature, f, F,eatures);
@@ -1972,7 +1982,7 @@ index 23fd2d3..1a48b81 100644
 +	return _gpuAddress;
  };
 diff --git a/src/indium/command-buffer.cpp b/src/indium/command-buffer.cpp
-index 43f4a84..f7640c5 100644
+index 43f4a84..0bad73b 100644
 --- a/src/indium/command-buffer.cpp
 +++ b/src/indium/command-buffer.cpp
 @@ -1,3 +1,8 @@
@@ -1984,7 +1994,7 @@ index 43f4a84..f7640c5 100644
  #include <indium/command-buffer.private.hpp>
  #include <indium/command-queue.private.hpp>
  #include <indium/device.private.hpp>
-@@ -8,7 +13,116 @@
+@@ -8,7 +13,117 @@
  #include <indium/compute-command-encoder.private.hpp>
  #include <indium/dynamic-vk.hpp>
  
@@ -1999,6 +2009,7 @@ index 43f4a84..f7640c5 100644
 +#include <unistd.h>
 +#include <indium/counters.private.hpp>
  #include <condition_variable>
++#include <indium/direct-diag.private.hpp>
 +#include <indium/retirement-queue.private.hpp>
 +
 +// Aggregated timings, printed every 5 s, when /tmp/metal-debug-timing exists in the guest at process start
@@ -2101,7 +2112,7 @@ index 43f4a84..f7640c5 100644
  
  Indium::CommandBuffer::~CommandBuffer() {};
  
-@@ -19,18 +133,47 @@ std::shared_ptr<Indium::Device> Indium::PrivateCommandBuffer::device() {
+@@ -19,18 +134,47 @@ std::shared_ptr<Indium::Device> Indium::PrivateCommandBuffer::device() {
  	return _privateDevice;
  };
  
@@ -2151,7 +2162,7 @@ index 43f4a84..f7640c5 100644
  		// TODO: handle this in a more C++-friendly way
  		abort();
  	}
-@@ -41,13 +184,64 @@ Indium::PrivateCommandBuffer::PrivateCommandBuffer(std::shared_ptr<PrivateComman
+@@ -41,13 +185,64 @@ Indium::PrivateCommandBuffer::PrivateCommandBuffer(std::shared_ptr<PrivateComman
  		// TODO: same
  		abort();
  	}
@@ -2218,7 +2229,7 @@ index 43f4a84..f7640c5 100644
  	auto encoder = std::make_shared<Indium::PrivateRenderCommandEncoder>(shared_from_this(), descriptor);
  	{
  		std::scoped_lock lock(_mutex);
-@@ -56,7 +250,65 @@ std::shared_ptr<Indium::RenderCommandEncoder> Indium::PrivateCommandBuffer::rend
+@@ -56,7 +251,65 @@ std::shared_ptr<Indium::RenderCommandEncoder> Indium::PrivateCommandBuffer::rend
  	return encoder;
  };
  
@@ -2284,7 +2295,7 @@ index 43f4a84..f7640c5 100644
  	auto encoder = std::make_shared<Indium::PrivateBlitCommandEncoder>(shared_from_this());
  	{
  		std::scoped_lock lock(_mutex);
-@@ -66,6 +318,16 @@ std::shared_ptr<Indium::BlitCommandEncoder> Indium::PrivateCommandBuffer::blitCo
+@@ -66,6 +319,16 @@ std::shared_ptr<Indium::BlitCommandEncoder> Indium::PrivateCommandBuffer::blitCo
  };
  
  std::shared_ptr<Indium::BlitCommandEncoder> Indium::PrivateCommandBuffer::blitCommandEncoder(const BlitPassDescriptor& descriptor) {
@@ -2301,7 +2312,7 @@ index 43f4a84..f7640c5 100644
  	auto encoder = std::make_shared<Indium::PrivateBlitCommandEncoder>(shared_from_this(), descriptor);
  	{
  		std::scoped_lock lock(_mutex);
-@@ -79,6 +341,7 @@ std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::com
+@@ -79,6 +342,7 @@ std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::com
  };
  
  std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::computeCommandEncoder(const ComputePassDescriptor& descriptor) {
@@ -2309,7 +2320,7 @@ index 43f4a84..f7640c5 100644
  	auto encoder = std::make_shared<Indium::PrivateComputeCommandEncoder>(shared_from_this(), descriptor);
  	{
  		std::scoped_lock lock(_mutex);
-@@ -91,10 +354,269 @@ std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::com
+@@ -91,10 +355,273 @@ std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::com
  	return computeCommandEncoder(ComputePassDescriptor { {}, dispatchType });
  };
  
@@ -2530,6 +2541,10 @@ index 43f4a84..f7640c5 100644
 +bool Indium::bindingReuseEnabled() {return bindingReuse.load(std::memory_order_relaxed);}
 +
  void Indium::PrivateCommandBuffer::commit() {
++	// darling-lol (direct presentation prototype diagnostics): the application thread's whole commit call, including the
++	// presenting drain@commit wait, separately for presenting and other command buffers.
++	DirectDiag::Span commitCall(SubmitThread::onWorker() ? (_drawablesToPresent.empty() ? "worker.commit.other" : "worker.commit.presenting")
++		: (_drawablesToPresent.empty() ? "commit.other" : "commit.presenting"));
 +    refreshBindingReuse();
 +	// With deferred render encoding the encoders are applied on the ordered worker, so the whole commit (it reads what the
 +	// encoders recorded, ends the Vulkan command buffer and reserves timeline values in submission order) must run there too.
@@ -2579,7 +2594,7 @@ index 43f4a84..f7640c5 100644
  
  	for (const auto& encoder: _commandEncoders) {
  		if (auto renderEncoder = std::dynamic_pointer_cast<PrivateRenderCommandEncoder>(encoder)) {
-@@ -110,16 +632,28 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -110,16 +637,28 @@ void Indium::PrivateCommandBuffer::commit() {
  			}
  		}
  
@@ -2609,7 +2624,7 @@ index 43f4a84..f7640c5 100644
  
  	// for the event loop
  	auto timelineSemaphore = _privateDevice->getWrappedTimelineSemaphore();
-@@ -138,14 +672,49 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -138,14 +677,49 @@ void Indium::PrivateCommandBuffer::commit() {
  			readWriteTextures.insert(readWriteTextures.end(), readWrite.begin(), readWrite.end());
  		}
  
@@ -2662,7 +2677,7 @@ index 43f4a84..f7640c5 100644
  	}
  
  	std::vector<VkSemaphoreSubmitInfo> signalInfos;
-@@ -202,11 +771,13 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -202,11 +776,13 @@ void Indium::PrivateCommandBuffer::commit() {
  		auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture);
  		const auto& presentSema = presentationSemaphores[i];
  
@@ -2681,7 +2696,7 @@ index 43f4a84..f7640c5 100644
  
  		handleTextureSemaphores(privateTexture);
  	}
-@@ -215,7 +786,15 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -215,7 +791,15 @@ void Indium::PrivateCommandBuffer::commit() {
  	//        but it also leaves the resources for this command buffer tied up, essentially becoming a memory leak.
  	//        i've observed this in the cube example, and it happens more than once (because the example display semaphore is exhausted and never signaled).
  	// UPDATE: upon further testing, it seems that this only occurs when the view is off-screen/hidden. weird.
@@ -2698,7 +2713,7 @@ index 43f4a84..f7640c5 100644
  		{
  			std::unique_lock lock(self->_mutex);
  			self->_completed = true;
-@@ -234,8 +813,47 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -234,8 +818,47 @@ void Indium::PrivateCommandBuffer::commit() {
  		// the handlers may have captured a reference to us (from their surrounding scope), so clear out handlers so those references go away
  		self->_scheduledHandlers.clear();
  		self->_completedHandlers.clear();
@@ -2746,7 +2761,7 @@ index 43f4a84..f7640c5 100644
  	commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
  	commandBufferInfo.commandBuffer = _commandBuffer;
  
-@@ -252,23 +870,41 @@ void Indium::PrivateCommandBuffer::commit() {
+@@ -252,23 +875,41 @@ void Indium::PrivateCommandBuffer::commit() {
  	//        the Device constructor tries to choose command queues that support as many operations as possible, but it's possible
  	//        that a particular device only supports certain operations on certain queues (e.g. maybe it only supports transfer operations
  	//        on an exclusive queue that doesn't support graphics or compute).
@@ -2793,7 +2808,7 @@ index 43f4a84..f7640c5 100644
  };
  
  void Indium::PrivateCommandBuffer::presentDrawable(std::shared_ptr<Drawable> drawable) {
-@@ -307,9 +943,12 @@ void Indium::PrivateCommandBuffer::addCompletedHandler(std::function<void(std::s
+@@ -307,9 +948,12 @@ void Indium::PrivateCommandBuffer::addCompletedHandler(std::function<void(std::s
  };
  
  void Indium::PrivateCommandBuffer::waitUntilCompleted() {
@@ -2906,7 +2921,7 @@ index 5f62ad0..5957bec 100644
  	DynamicVK::vkCmdBindDescriptorSets(buf->commandBuffer(), VK_PIPELINE_BIND_POINT_COMPUTE, _pso->layout(), 0, descriptorSets.size(), descriptorSets.data(), 0, nullptr);
  };
 diff --git a/src/indium/device.cpp b/src/indium/device.cpp
-index 322e186..f712c7a 100644
+index 322e186..9a3b9c4 100644
 --- a/src/indium/device.cpp
 +++ b/src/indium/device.cpp
 @@ -1,4 +1,9 @@
@@ -3150,7 +3165,7 @@ index 322e186..f712c7a 100644
 +		memcpy(candidate.deviceUUID, idProperties.deviceUUID, 16);
 +		memcpy(candidate.driverUUID, idProperties.driverUUID, 16);
 +		candidates.push_back(candidate);
-+	}
+ 	}
 +
 +	// Resolve the explicit selection against the supported list. An explicit choice
 +	// is honoured even when it names a software (CPU) device, because the user asked
@@ -3233,7 +3248,7 @@ index 322e186..f712c7a 100644
 +
 +	for (size_t index: creationOrder) {
 +		globalDeviceList.push_back(std::make_shared<PrivateDevice>(candidates[index].device));
- 	}
++	}
 +
 +	appendDeviceLog("created VkDevice for " + std::to_string(globalDeviceList.size()) + " of "
 +		+ std::to_string(candidates.size()) + " supported device(s)"
@@ -3259,7 +3274,7 @@ index 322e186..f712c7a 100644
  
  	std::vector<VkQueueFamilyProperties> queueFamilies;
  	uint32_t count = 0;
-@@ -233,6 +507,36 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
+@@ -233,6 +507,62 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
  		}
  	}
  
@@ -3293,10 +3308,36 @@ index 322e186..f712c7a 100644
 +		}
 +	}
 +
++	// darling-lol: direct presentation (see directPresentationRequested) retires swapchains through present
++	// fences and gives back acquired but unpresented images, both from VK_EXT_swapchain_maintenance1. Without the
++	// flag nothing changes.
++	VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swapchainMaintenance1 {};
++	swapchainMaintenance1.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
++	if (directPresentationRequested() && !!(indiumFeatures & Feature::Swapchain)) {
++		bool hasMaintenance1 = false;
++		for (const auto& prop: extProps) {
++			if (strcmp(prop.extensionName, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) == 0) {
++				hasMaintenance1 = true;
++			}
++		}
++		if (hasMaintenance1) {
++			VkPhysicalDeviceFeatures2 query {};
++			query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
++			query.pNext = &swapchainMaintenance1;
++			DynamicVK::vkGetPhysicalDeviceFeatures2(_physicalDevice, &query);
++			if (swapchainMaintenance1.swapchainMaintenance1) {
++				swapchainMaintenance1.pNext = features13.pNext;
++				features13.pNext = &swapchainMaintenance1;
++				extensions.push_back(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
++				indiumFeatures = indiumFeatures | Feature::SwapchainMaintenance1;
++			}
++		}
++	}
++
  	VkDeviceCreateInfo deviceCreateInfo {};
  	deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
  	deviceCreateInfo.pQueueCreateInfos = queueCreateInfos.data();
-@@ -246,6 +550,7 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
+@@ -246,6 +576,7 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
  	}
  
  	_features = indiumFeatures;
@@ -3304,7 +3345,7 @@ index 322e186..f712c7a 100644
  
  	for (const auto& index: queueFamilyIndices) {
  		VkQueue queue;
-@@ -297,6 +602,9 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
+@@ -297,6 +628,9 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
  };
  
  Indium::PrivateDevice::~PrivateDevice() {
@@ -3314,7 +3355,7 @@ index 322e186..f712c7a 100644
  	if (_oneshotCommandPool) {
  		DynamicVK::vkDestroyCommandPool(_device, _oneshotCommandPool, nullptr);
  	}
-@@ -308,6 +616,23 @@ std::string Indium::PrivateDevice::name() const {
+@@ -308,6 +642,23 @@ std::string Indium::PrivateDevice::name() const {
  	return _properties.deviceName;
  };
  
@@ -3338,7 +3379,7 @@ index 322e186..f712c7a 100644
  std::shared_ptr<Indium::CommandQueue> Indium::PrivateDevice::newCommandQueue() {
  	return std::make_shared<PrivateCommandQueue>(shared_from_this());
  };
-@@ -317,9 +642,9 @@ std::shared_ptr<Indium::RenderPipelineState> Indium::PrivateDevice::newRenderPip
+@@ -317,9 +668,9 @@ std::shared_ptr<Indium::RenderPipelineState> Indium::PrivateDevice::newRenderPip
  };
  
  std::shared_ptr<Indium::ComputePipelineState> Indium::PrivateDevice::newComputePipelineState(const ComputePipelineDescriptor& descriptor, PipelineOption options, std::shared_ptr<ComputePipelineReflection> reflection) {
@@ -3351,7 +3392,7 @@ index 322e186..f712c7a 100644
  	return std::make_shared<PrivateComputePipelineState>(shared_from_this(), descriptor);
  };
  
-@@ -357,6 +682,7 @@ std::shared_ptr<Indium::Library> Indium::PrivateDevice::newLibrary(const void* d
+@@ -357,6 +708,7 @@ std::shared_ptr<Indium::Library> Indium::PrivateDevice::newLibrary(const void* d
  				break;
  		}
  
@@ -3359,7 +3400,7 @@ index 322e186..f712c7a 100644
  		funcInfo.bindings.insert(funcInfo.bindings.end(), info.bindings.begin(), info.bindings.end());
  		funcInfo.embeddedSamplers.insert(funcInfo.embeddedSamplers.end(), info.embeddedSamplers.begin(), info.embeddedSamplers.end());
  	}
-@@ -382,6 +708,19 @@ std::shared_ptr<Indium::Device> Indium::createSystemDefaultDevice() {
+@@ -382,6 +734,19 @@ std::shared_ptr<Indium::Device> Indium::createSystemDefaultDevice() {
  	return globalDeviceList.empty() ? nullptr : globalDeviceList.front();
  };
  
@@ -3379,7 +3420,7 @@ index 322e186..f712c7a 100644
  void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  	// this is held for the entire duration of the poll so we can
  	// ensure we're the only one polling, which allows us to avoid
-@@ -393,9 +732,35 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+@@ -393,9 +758,35 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  	const std::vector<VkSemaphore> semaphores = _eventLoopSemaphores;
  	const std::vector<uint64_t> values = _eventLoopWaitValues;
  	const std::vector<std::function<void()>> callbacks = _eventLoopCallbacks;
@@ -3415,7 +3456,7 @@ index 322e186..f712c7a 100644
  	VkSemaphoreWaitInfo info {};
  	info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
  	info.semaphoreCount = semaphores.size();
-@@ -403,7 +768,19 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+@@ -403,7 +794,19 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
  	info.pValues = values.data();
  	info.flags = VK_SEMAPHORE_WAIT_ANY_BIT;
  
@@ -3436,7 +3477,7 @@ index 322e186..f712c7a 100644
  
  	if (result == VK_TIMEOUT) {
  		// timed out with no semaphores ready
-@@ -474,15 +851,30 @@ void Indium::PrivateDevice::waitForSemaphore(VkSemaphore semaphore, uint64_t tar
+@@ -474,15 +877,30 @@ void Indium::PrivateDevice::waitForSemaphore(VkSemaphore semaphore, uint64_t tar
  		_eventLoopSemaphores.push_back(semaphore);
  		_eventLoopWaitValues.push_back(targetValue);
  		_eventLoopCallbacks.push_back(callback);
@@ -3470,7 +3511,7 @@ index 322e186..f712c7a 100644
  	VkSemaphoreTypeCreateInfo typeInfo {};
  	typeInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
  	typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-@@ -505,7 +897,14 @@ Indium::TimelineSemaphore Indium::PrivateDevice::getTimelineSemaphore() {
+@@ -505,7 +923,14 @@ Indium::TimelineSemaphore Indium::PrivateDevice::getTimelineSemaphore() {
  };
  
  void Indium::PrivateDevice::putTimelineSemaphore(const TimelineSemaphore& semaphore) {
@@ -3486,7 +3527,7 @@ index 322e186..f712c7a 100644
  };
  
  std::shared_ptr<Indium::TimelineSemaphore> Indium::PrivateDevice::getWrappedTimelineSemaphore() {
-@@ -551,3 +950,160 @@ std::shared_ptr<Indium::BinarySemaphore> Indium::PrivateDevice::getWrappedBinary
+@@ -551,3 +976,160 @@ std::shared_ptr<Indium::BinarySemaphore> Indium::PrivateDevice::getWrappedBinary
  		delete ptr;
  	});
  };
@@ -3686,10 +3727,17 @@ index a4677c3..69ef23f 100644
  	libraryHandle = _elfcalls->dlopen("libvulkan.so.1");
  #else
 diff --git a/src/indium/indium.cpp b/src/indium/indium.cpp
-index e7c06fe..6e1f4b1 100644
+index e7c06fe..75592e7 100644
 --- a/src/indium/indium.cpp
 +++ b/src/indium/indium.cpp
-@@ -10,15 +10,26 @@
+@@ -5,20 +5,53 @@
+ #include <iridium/iridium.hpp>
+ 
+ #include <unordered_set>
++#include <string>
++#include <vector>
+ 
+ #include <cstring>
  #include <string_view>
  
  #include <iostream>
@@ -3699,6 +3747,26 @@ index e7c06fe..6e1f4b1 100644
  
  VkInstance Indium::globalInstance = VK_NULL_HANDLE;
  
++static std::vector<std::string> enabledInstanceExtensions;
++
++bool Indium::directPresentationRequested() {
++#ifdef INDIUM_DIRECT_PRESENT_DEFAULT_ON
++	static const bool requested = access("/tmp/metal-no-direct-present", F_OK) != 0;
++#else
++	static const bool requested = access("/tmp/metal-direct-present", F_OK) == 0;
++#endif
++	return requested;
++}
++
++bool Indium::instanceExtensionEnabled(const char* name) {
++	for (const auto& extension: enabledInstanceExtensions) {
++		if (extension == name) {
++			return true;
++		}
++	}
++	return false;
++}
++
  static VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
  
  static volatile int noOptOut;
@@ -3717,7 +3785,7 @@ index e7c06fe..6e1f4b1 100644
  
  	if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
  		// convenient breakpoint
-@@ -43,6 +54,11 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
+@@ -43,6 +76,11 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
  		VK_KHR_SURFACE_EXTENSION_NAME,
  	};
  
@@ -3729,7 +3797,43 @@ index e7c06fe..6e1f4b1 100644
  	uint32_t count;
  
  	std::vector<VkLayerProperties> layerProps;
-@@ -97,13 +113,13 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
+@@ -68,8 +106,33 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
+ 		extensionSet.insert(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+ 	}
+ 
+-	for (size_t i = 0; i < additionalExtensionCount; ++i) {
+-		extensionSet.insert(additionalExtensions[i]);
++	// darling-lol: optional instance extensions (e.g. a window-system surface for direct presentation) are only
++	// requested when the loader offers them, so an unavailable one never makes instance creation fail.
++	std::vector<VkExtensionProperties> instanceExtensions;
++	if (auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(DynamicVK::vkGetInstanceProcAddr(NULL, "vkEnumerateInstanceExtensionProperties"))) {
++		uint32_t extensionCount = 0;
++		enumerate(nullptr, &extensionCount, nullptr);
++		instanceExtensions.resize(extensionCount);
++		enumerate(nullptr, &extensionCount, instanceExtensions.data());
++		instanceExtensions.resize(extensionCount);
++	}
++	// darling-lol: direct presentation (guest flag /tmp/metal-direct-present) presents CAMetalLayer drawables through a
++	// swapchain on the layer's X11 window; the surface extension is only requested then, and only if available.
++	std::vector<const char*> requested(additionalExtensions, additionalExtensions + additionalExtensionCount);
++	if (directPresentationRequested()) {
++		requested.push_back("VK_KHR_xlib_surface");
++	}
++	for (const char* name: requested) {
++		bool available = false;
++		for (const auto& extension: instanceExtensions) {
++			if (strcmp(extension.extensionName, name) == 0) {
++				available = true;
++				break;
++			}
++		}
++		if (available) {
++			extensionSet.insert(name);
++		}
+ 	}
+ 
+ 	std::vector<const char*> extensions(extensionSet.begin(), extensionSet.end());
+@@ -97,13 +160,13 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
  
  	VkValidationFeaturesEXT valFeat {};
  	std::vector<VkValidationFeatureEnableEXT> valFeatures {
@@ -3745,7 +3849,15 @@ index e7c06fe..6e1f4b1 100644
  		createInfo.pNext = &valFeat;
  	}
  
-@@ -133,7 +149,10 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
+@@ -112,6 +175,7 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
+ 		// TODO: maybe warn?
+ 		return;
+ 	}
++	enabledInstanceExtensions.assign(extensions.begin(), extensions.end());
+ 
+ 	if (!DynamicVK::eagerlyResolveRequired()) {
+ 		// TODO: maybe warn?
+@@ -133,7 +197,10 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
  	initGlobalDeviceList();
  };
  
@@ -3756,7 +3868,7 @@ index e7c06fe..6e1f4b1 100644
  	finitGlobalDeviceList();
  
  	if (debugMessenger && DynamicVK::vkDestroyDebugUtilsMessengerEXT) {
-@@ -146,4 +165,5 @@ void Indium::finit() {
+@@ -146,4 +213,5 @@ void Indium::finit() {
  	DynamicVK::finit();
  
  	Iridium::finit();
@@ -8964,3 +9076,117 @@ index 0000000..962fdad
 +    return microseconds * 1000;
 +}
 +}
+diff --git a/private-include/indium/direct-diag.private.hpp b/private-include/indium/direct-diag.private.hpp
+new file mode 100644
+index 0000000..d251854
+--- /dev/null
++++ b/private-include/indium/direct-diag.private.hpp
+@@ -0,0 +1,93 @@
++#pragma once
++
++// darling-lol (prototype diagnostics): per-site counts and durations of the presentation paths, for the direct
++// presentation experiment. Only active when the guest flag /tmp/metal-direct-diag exists at process start (checked once
++// per image); otherwise every site costs one predictable branch. Summaries append to the guest's
++// /tmp/metal-direct-diag.log every 5 s: per site n, sum, mean, max and log2-bucket p50/p95 (bucket upper bounds).
++// Header-only with hidden visibility: each image (libindium, Metal, QuartzCore) keeps and prints its own state.
++
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <ctime>
++#include <map>
++#include <mutex>
++#include <string>
++#include <unistd.h>
++
++#define INDIUM_DIRECT_DIAG_LOCAL __attribute__((visibility("hidden")))
++
++namespace Indium {
++	namespace DirectDiag {
++		INDIUM_DIRECT_DIAG_LOCAL inline bool enabled() {
++			static const bool value = access("/tmp/metal-direct-diag", F_OK) == 0;
++			return value;
++		}
++
++		INDIUM_DIRECT_DIAG_LOCAL inline uint64_t now() {
++			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++				std::chrono::steady_clock::now().time_since_epoch()).count());
++		}
++
++		struct INDIUM_DIRECT_DIAG_LOCAL Stat {
++			uint64_t n = 0, sum = 0, max = 0;
++			uint64_t buckets[40] = {};
++		};
++
++		INDIUM_DIRECT_DIAG_LOCAL inline double percentile(const Stat& stat, double q) {
++			const uint64_t target = static_cast<uint64_t>(stat.n * q);
++			uint64_t seen = 0;
++			for (int i = 0; i < 40; ++i) {
++				seen += stat.buckets[i];
++				if (seen > target) return (i == 0 ? 1.0 : static_cast<double>(1ull << i)) / 1000.0; // us, bucket upper bound
++			}
++			return stat.max / 1000.0;
++		}
++
++		// value in nanoseconds; counters pass 0 and only n matters
++		INDIUM_DIRECT_DIAG_LOCAL inline void record(const char* site, uint64_t nanoseconds) {
++			if (!enabled()) return;
++			static std::mutex lock;
++			static std::map<std::string, Stat>* stats = new std::map<std::string, Stat>;
++			static time_t last = 0;
++			std::lock_guard<std::mutex> guard(lock);
++			Stat& stat = (*stats)[site];
++			++stat.n;
++			stat.sum += nanoseconds;
++			if (nanoseconds > stat.max) stat.max = nanoseconds;
++			int bucket = 0;
++			while (bucket < 39 && (1ull << bucket) < nanoseconds) ++bucket;
++			++stat.buckets[bucket];
++			const time_t current = time(nullptr);
++			if (last == 0) last = current;
++			if (current - last >= 5) {
++				last = current;
++				if (FILE* log = fopen("/tmp/metal-direct-diag.log", "a")) {
++					fprintf(log, "diag@%ld pid=%d:", (long) current, (int) getpid());
++					for (auto& entry: *stats) {
++						const Stat& s = entry.second;
++						fprintf(log, " %s[n=%llu sum=%.1fus mean=%.2fus p50<=%.1fus p95<=%.1fus max=%.1fus]", entry.first.c_str(),
++							(unsigned long long) s.n, s.sum / 1000.0, s.n ? s.sum / 1000.0 / s.n : 0.0, percentile(s, 0.5),
++							percentile(s, 0.95), s.max / 1000.0);
++					}
++					fprintf(log, "\n");
++					fclose(log);
++				}
++				stats->clear();
++			}
++		}
++
++		INDIUM_DIRECT_DIAG_LOCAL inline void count(const char* site) {
++			record(site, 0);
++		}
++
++		// Scoped duration of `site` (recorded at destruction).
++		struct INDIUM_DIRECT_DIAG_LOCAL Span {
++			const char* site;
++			uint64_t start = 0;
++			// A null site records nothing.
++			explicit Span(const char* site_): site(site_) { if (site && enabled()) start = now(); }
++			~Span() { if (start != 0) record(site, now() - start); }
++		};
++	};
++};
+diff --git a/private-include/indium/instance.private.hpp b/private-include/indium/instance.private.hpp
+index 62d0283..5f5a86b 100644
+--- a/private-include/indium/instance.private.hpp
++++ b/private-include/indium/instance.private.hpp
+@@ -4,4 +4,10 @@
+ 
+ namespace Indium {
+ 	extern VkInstance globalInstance;
++	// darling-lol: whether the global instance was created with this (optional) extension enabled.
++	bool instanceExtensionEnabled(const char* name);
++	// darling-lol (direct presentation prototype): whether CAMetalLayer presents through a Vulkan swapchain. Guest
++	// flag /tmp/metal-direct-present; a build with INDIUM_DIRECT_PRESENT_DEFAULT_ON enables it unless
++	// /tmp/metal-no-direct-present exists (an A/B arm that differs only in libindium). Read once per process.
++	bool directPresentationRequested();
+ };

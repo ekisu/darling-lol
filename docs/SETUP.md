@@ -170,6 +170,22 @@ The hand-off experiments (`metal-present-dispatch-wait`, `metal-deferred-blit` a
 | `/tmp/metal-submit-batch-max` | command buffers per batch (1–256, default 16), re-read like the window; `64` lets one batch hold a whole frame |
 | `/tmp/metal-debug-waits` | diagnostic: counts how often and how long threads block at the hand-off waits and in `nextDrawable`, every 5 s in `/tmp/metal-trace.log`; the first check writes a `waits enabled` line |
 
+#### Direct Vulkan presentation (experimental, off by default)
+
+With `/tmp/metal-direct-present`, a `CAMetalLayer` presents its drawables through a Vulkan swapchain created directly on the layer's X11 window (`VK_KHR_xlib_surface`), instead of copying each frame into the OpenGL texture that the compositor draws on the main thread. The swapchain images are the drawables, so there is no copy per frame. The present runs on the submit thread, after the frame's command buffer, and the main thread no longer composites Metal frames. With `displaySync` off (League turns it off), the swapchain uses `IMMEDIATE`, then `MAILBOX` if that is missing, then `FIFO`. With `displaySync` on it uses `FIFO`. The device needs `VK_EXT_swapchain_maintenance1`, and the instance `VK_KHR_xlib_surface`. When a requirement is missing, the layer stays on the legacy path and the reason goes to `/tmp/metal-direct-present.log`. Possible reasons include a window size that differs from the drawable size, a pixel format that is not a surface format, too few images or no opaque composite alpha. A layer whose present fails also goes back to the legacy path. The legacy frame-end wait (`drain@commit`) is kept on both paths.
+
+It changes QuartzCore (`patches/cocotron.patch`) and Indium (`patches/metal--deps--indium.patch`), so install them together. `tools/install-riot-gpu-runtime.sh` builds and installs the whole GPU set. A libindium built with `-DINDIUM_DIRECT_PRESENT_DEFAULT_ON=1` enables it without the flag; `/tmp/metal-no-direct-present` then turns it off.
+
+| Guest file | Effect when present |
+|---|---|
+| `/tmp/metal-direct-present` | enables direct presentation (read once per game process) |
+| `/tmp/metal-no-direct-present` | disables it in a default-on libindium; ignored otherwise |
+| `/tmp/metal-direct-diag` | diagnostic: durations and counts of the presentation sites of both paths, every 5 s in `/tmp/metal-direct-diag.log` (n, mean, max and log2-bucket p50/p95). Without the file the counters cost one predictable branch |
+
+`/tmp/metal-direct-present.log` records swapchain creation, activation, fallback and retirement once per transition, never per frame.
+
+Measured on an RX 6600 (RADV, Mesa 26.2.4) in a League 16.21 replay, in fullscreen 1920×1080 at 144 Hz on KWin 6.7.5 with `AllowTearing` at its default (on). Base and candidate both had the CPU address shadow. Presentation requests per second were +2.1%, +9.6% and +7.0% in three paired runs. That is the request rate, not the frame rate shown on screen. The DRM plane state showed KWin scanning out the game's own buffers on both paths. With direct presentation the scanout buffer changed about as often as the game presented (~294 flips/s, `IMMEDIATE`). The legacy path's flips stayed locked to the 144 Hz refresh. Nested gamescope (Wayland or SDL backend) made KWin composite again. A practice game through the Riot client also ran with the direct path active. Not covered yet: losing the window or the X connection during a game, NVIDIA and Intel drivers, apps with several Metal layers, and a full ranked or normal match.
+
 Create these files from inside the guest, for example `darling shell touch /tmp/metal-debug-waits`, or while Darling is shut down. The guest `/tmp` is `~/.darling/private/tmp` seen through Darling's overlay mount. A file created on the host in that directory while Darling runs may stay invisible to guest processes that already looked for it. The same applies to removing a file. The older `/tmp/metal-no-present-dispatch-wait`, `/tmp/metal-no-deferred-blit` and `/tmp/metal-no-skip-cpu-devices` files are ignored.
 
 ### Game-process switches

@@ -9665,9 +9665,10 @@ index 5dcac115..5de4f03f 100644
 +
  @end
 diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
+index 5dce8c56..6d025856 100644
 --- a/QuartzCore/CALayerContext.m
 +++ b/QuartzCore/CALayerContext.m
-@@ -1,47 +1,89 @@
+@@ -1,83 +1,220 @@
  #import <Foundation/NSString.h>
 +#import <Foundation/NSMutableArray.h>
  #import <QuartzCore/CALayer.h>
@@ -9679,9 +9680,40 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
 +#include <stdlib.h>
 +#include <stdio.h>
  #import <OpenGL/CGLInternal.h>
++#import <objc/runtime.h>
  
  @class CAMetalLayerInternal;
  
+-@implementation CALayerContext
++/* darling-lol (direct presentation prototype): while a CAMetalLayer presents its drawables through a Vulkan
++ * swapchain on this context's window, it is the only writer of that window: the legacy compositor neither
++ * renders nor swaps. The layer is told before the window goes away or changes. */
++@interface CALayer (DarlingDirectPresentation)
++- (BOOL) _directOwnsWindow;
++- (void) _directContextChanged;
++- (void) _directWindowWillChange;
++@end
+ 
+-@synthesize glContext = _glContext;
++static BOOL directOwnsWindow(CALayer *layer) {
++    return layer && [layer respondsToSelector: @selector(_directOwnsWindow)] && [layer _directOwnsWindow];
++}
+ 
+-- initWithFrame: (CGRect) rect {
+-    CGLError error;
++static void directContextChanged(CALayer *layer) {
++    if ([layer respondsToSelector: @selector(_directContextChanged)]) [layer _directContextChanged];
++}
+ 
+-    CGLPixelFormatAttribute attributes[1] = {
+-            0,
+-    };
+-    GLint numberOfVirtualScreens;
++static void directWindowWillChange(CALayer *layer) {
++    if ([layer respondsToSelector: @selector(_directWindowWillChange)]) [layer _directWindowWillChange];
++}
+ 
+-    CGLChoosePixelFormat(attributes, &_pixelFormat, &numberOfVirtualScreens);
 +/* A flattened IOSurface only replaces local rendering for trees without
 + * Metal content. Skipping a mixed tree also skips prepareRender, exhausting
 + * its drawable pool even though presentation callbacks continue to run. */
@@ -9692,7 +9724,11 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
 +        if (hasMetalLayer(child))return YES;
 +    return NO;
 +}
-+
+ 
+-    if ((error = CGLCreateContext(_pixelFormat, NULL, &_glContext)) !=
+-        kCGLNoError)
+-        NSLog(@"CGLCreateContext failed with %d in %s %d", error, __FILE__,
+-              __LINE__);
 +static GLint metalSwapInterval(CALayer *layer) {
 +    GLint interval = -1;
 +    if ([[layer class] isSubclassOfClass: [CAMetalLayerInternal class]])
@@ -9703,7 +9739,8 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
 +    }
 +    return interval;
 +}
-+
+ 
+-    _frame = rect;
 +/* The X11 transport presents Chromium's flattened full-window surface.
 + * Avoid uploading and compositing that same window again into a covered GL
 + * child. Restrict this to the explicitly configured native presentation path. */
@@ -9728,35 +9765,20 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
 +           !hasMetalLayer(layer) &&
 +           (!getenv("RCLOL_GPU_DIRECT_PRESENT") || hasFullWindowSurface(layer, size));
 +}
- @implementation CALayerContext
- 
- @synthesize glContext = _glContext;
++@implementation CALayerContext
++
++@synthesize glContext = _glContext;
 +@synthesize subwindow = _subwindow;
  
- - initWithFrame: (CGRect) rect {
--    CGLError error;
--
--    CGLPixelFormatAttribute attributes[1] = {
--            0,
--    };
--    GLint numberOfVirtualScreens;
--
--    CGLChoosePixelFormat(attributes, &_pixelFormat, &numberOfVirtualScreens);
--
--    if ((error = CGLCreateContext(_pixelFormat, NULL, &_glContext)) !=
--        kCGLNoError)
--        NSLog(@"CGLCreateContext failed with %d in %s %d", error, __FILE__,
--              __LINE__);
--
+-    _renderer = [[CARenderer rendererWithCGLContext: _glContext
+-                                            options: nil] retain];
++- initWithFrame: (CGRect) rect {
 +    self = [super init];
 +    if (self == nil)
 +        return nil;
 +
 +    _deleteTextureIds = [[NSMutableArray alloc] init];
-     _frame = rect;
--
--    _renderer = [[CARenderer rendererWithCGLContext: _glContext
--                                            options: nil] retain];
++    _frame = rect;
 +    /* Views can acquire a backing layer before joining a window. Defer
 +     * expensive native GL resources until there is a drawable. */
  
@@ -9766,6 +9788,7 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
  - (void) dealloc {
 -    [_timer invalidate];
 -    [_timer release];
++    directWindowWillChange(_layer);
 +    [self invalidate];
 +    [_deleteTextureIds release];
      [_renderer release];
@@ -9778,7 +9801,34 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
      [super dealloc];
  }
  
-@@ -51,12 +93,22 @@
+ - (void) setFrame: (CGRect) rect {
++    BOOL changed = !CGRectEqualToRect(_frame, rect);
+     _frame = rect;
+     [_subwindow setFrame: _frame];
++    if (changed) directContextChanged(_layer);
++}
++
++/* darling-lol (direct presentation prototype): the native window this context's surface draws into: the parent
++ * window when the full-window game view borrows the parent's surface, otherwise its own child window. */
++- (BOOL) _directPresentationDisplay: (void **) display window: (unsigned long *) window frame: (CGRect *) frame {
++    if (!_subwindow || !_cglWindow || ![_subwindow isKindOfClass: NSClassFromString(@"X11SubWindow")]) return NO;
++    Ivar displayIvar = class_getInstanceVariable([_subwindow class], "_display");
++    if (!displayIvar) return NO;
++    *display = *(void **) ((char *) _subwindow + ivar_getOffset(displayIvar));
++    if (_ownsCglWindow) {
++        *window = (unsigned long) [_subwindow nativeWindow];
++    } else {
++        Ivar parentIvar = class_getInstanceVariable([_subwindow class], "_parent");
++        id parent = parentIvar ? object_getIvar(_subwindow, parentIvar) : nil;
++        if (!parent || ![parent respondsToSelector: @selector(windowHandle)]) return NO;
++        *window = (unsigned long) [parent performSelector: @selector(windowHandle)];
++    }
++    *frame = _frame;
++    return *display != NULL && *window != 0;
++}
++
++- (CALayer *) _directRootLayer {
++    return _layer;
  }
  
  - (void) setLayer: (CALayer *) layer {
@@ -9801,8 +9851,9 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
  }
  
  - (void) setSubwindow: (CGSubWindow*) subwindow
-@@ -64,20 +116,55 @@
+ {
      CGSubWindow* oldSubwindow = _subwindow;
++    directWindowWillChange(_layer);
  
      if (_cglWindow) {
 -        CGLDestroyWindow(_cglWindow);
@@ -9848,6 +9899,7 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
  }
  
  - (void) invalidate {
++    directWindowWillChange(_layer);
 +    [_timer invalidate];
 +    [_timer release];
 +    _timer = nil;
@@ -9859,7 +9911,7 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
  }
  
  - (void) assignTextureIdsToLayerTree: (CALayer *) layer {
-@@ -93,8 +180,43 @@
+@@ -93,8 +230,43 @@
          [self assignTextureIdsToLayerTree: child];
  }
  
@@ -9903,30 +9955,29 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
  
      glEnable(GL_DEPTH_TEST);
      glShadeModel(GL_SMOOTH);
-@@ -118,27 +240,63 @@
+@@ -118,27 +290,64 @@
  
      [_deleteTextureIds removeAllObjects];
  
 +    CFTimeInterval assignStart = CACurrentMediaTime();
 +    darlingQCTiming("renderLayerSetup", assignStart - renderLayerStart);
      [self assignTextureIdsToLayerTree: layer];
--
++    darlingQCTiming("assignTextureIds", CACurrentMediaTime() - assignStart);
+ 
 -    // this is where the Metal layer renders to an internal texture for us to use
 -    if ([[layer class] isSubclassOfClass: [CAMetalLayerInternal class]]) {
 -        CAMetalLayerInternal* mtl = (CAMetalLayerInternal*)layer;
 -        [mtl prepareRender];
 -    }
--
-+    darlingQCTiming("assignTextureIds", CACurrentMediaTime() - assignStart);
-+
 +    [self prepareMetalLayers: layer];
-+
+ 
 +    CFTimeInterval rendererStart = CACurrentMediaTime();
      [_renderer render];
 +    darlingQCTiming("rendererRender", CACurrentMediaTime() - rendererStart);
  }
  
  - (void) render {
++    if (directOwnsWindow(_layer)) return;
 +    [self updateDrawable];
 +    if (_cglWindow == NULL || _layer == nil)
 +        return;
@@ -9974,7 +10025,7 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
  }
  
  - (void) startTimerIfNeeded {
-@@ -147,7 +305,7 @@
+@@ -147,7 +356,7 @@
                                                     target: self
                                                   selector: @selector(timer:)
                                                   userInfo: nil
@@ -9983,11 +10034,12 @@ diff --git a/QuartzCore/CALayerContext.m b/QuartzCore/CALayerContext.m
  }
  
  - (void) deleteTextureId: (NSNumber *) textureId {
-@@ -155,7 +313,20 @@
+@@ -155,7 +364,21 @@
  }
  
  - (void) flush {
 -    CGLFlushDrawable(_glContext);
++    if (directOwnsWindow(_layer)) return;
 +    if(skipLocalRender(_layer, _frame.size))return;
 +    if (_glContext != NULL && _cglWindow != NULL) {
 +        CGLContextObj previous = CGLGetCurrentContext();
@@ -10016,24 +10068,25 @@ index 5ad375f8..c8e83814 100644
 +- (BOOL) _treeHasAnimations;
  @end
 diff --git a/QuartzCore/CAMetalDrawable.mm b/QuartzCore/CAMetalDrawable.mm
-index d6f86b31..687f05d5 100644
+index d6f86b31..a402137a 100644
 --- a/QuartzCore/CAMetalDrawable.mm
 +++ b/QuartzCore/CAMetalDrawable.mm
-@@ -31,6 +31,13 @@
+@@ -30,6 +30,14 @@
+ #include <OpenGL/gl.h>
  #include <OpenGL/glext.h>
  #include <indium/indium.private.hpp>
- 
++#include <indium/direct-diag.private.hpp>
++
 +#include <atomic>
 +#include <cstdio>
 +#include <cstring>
 +#include <mutex>
 +#include <string>
 +#include <unistd.h>
-+
+ 
  namespace DynamicVK = Indium::DynamicVK;
  
- static void reportGLErrors(void) {
-@@ -50,8 +57,111 @@ static void reportGLErrors(void) {
+@@ -50,8 +58,111 @@ static void reportGLErrors(void) {
  namespace Indium::DynamicVK {
  	static DynamicFunction<PFN_vkGetSemaphoreFdKHR> vkGetSemaphoreFdKHR("vkGetSemaphoreFdKHR");
  	static DynamicFunction<PFN_vkGetMemoryFdKHR> vkGetMemoryFdKHR("vkGetMemoryFdKHR");
@@ -10145,7 +10198,7 @@ index d6f86b31..687f05d5 100644
  //
  // helper classes
  //
-@@ -129,27 +239,109 @@ public:
+@@ -129,27 +240,109 @@ public:
  // texture
  //
  
@@ -10265,7 +10318,7 @@ index d6f86b31..687f05d5 100644
  	}
  
  	return targetIndex;
-@@ -161,6 +353,11 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat
+@@ -161,6 +354,11 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat
  	_pixelFormat(pixelFormat),
  	_framebufferOnly(framebufferOnly)
  {
@@ -10277,7 +10330,7 @@ index d6f86b31..687f05d5 100644
  	//
  	// create the images
  	//
-@@ -195,7 +392,7 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat
+@@ -195,7 +393,7 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat
  	// some drivers (e.g. AMD's drivers) don't play nice when sharing
  	// Vulkan images and OpenGL textures with optimal tiling
  	// (https://gitlab.freedesktop.org/mesa/mesa/-/issues/7657)
@@ -10286,7 +10339,7 @@ index d6f86b31..687f05d5 100644
  
  	VkExternalMemoryImageCreateInfo extMemInfo {};
  
-@@ -219,7 +416,7 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat
+@@ -219,7 +417,7 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat
  
  	DynamicVK::vkGetImageMemoryRequirements(_device->device(), _image, &reqs);
  
@@ -10295,7 +10348,7 @@ index d6f86b31..687f05d5 100644
  
  	if (targetIndex == SIZE_MAX) {
  		throw std::runtime_error("No suitable memory region found for image");
-@@ -242,7 +439,7 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat
+@@ -242,7 +440,7 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat
  
  	DynamicVK::vkGetImageMemoryRequirements(_device->device(), _internalImage, &reqs);
  
@@ -10304,7 +10357,7 @@ index d6f86b31..687f05d5 100644
  
  	if (targetIndex == SIZE_MAX) {
  		throw std::runtime_error("No suitable memory region found for internal image");
-@@ -380,31 +577,70 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat
+@@ -380,31 +578,70 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat
  		abort();
  	}
  
@@ -10380,7 +10433,16 @@ index d6f86b31..687f05d5 100644
  
  	glBindTexture(GL_TEXTURE_2D, prevTex);
  };
-@@ -605,35 +841,16 @@ void CAMetalDrawableActual::present() {
+@@ -499,6 +736,8 @@ void CAMetalDrawableTexture::replaceRegion(Indium::Region region, size_t mipmapL
+ };
+ 
+ void CAMetalDrawableTexture::precommit(std::shared_ptr<Indium::PrivateCommandBuffer> cmdbuf) {
++	// darling-lol (direct presentation prototype diagnostics): one full-size copy into the GL-importable image per call.
++	Indium::DirectDiag::count("legacy.precommitBlit");
+ 	// TODO: check if we need a barrier for the internal image as well; we probably do.
+ 	//       we might even need a separate semaphore for it.
+ 
+@@ -605,35 +844,16 @@ void CAMetalDrawableActual::present() {
  			return;
  		}
  
@@ -10422,7 +10484,7 @@ index d6f86b31..687f05d5 100644
  	}
  }
  
-@@ -702,9 +919,46 @@ void CAMetalDrawableActual::reset() {
+@@ -702,9 +922,46 @@ void CAMetalDrawableActual::reset() {
  };
  
  void CAMetalDrawableActual::synchronizeRender() {
@@ -10473,18 +10535,29 @@ index d6f86b31..687f05d5 100644
  
  static void glDebugCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* message, const void* context) {
 diff --git a/QuartzCore/CAMetalLayer.mm b/QuartzCore/CAMetalLayer.mm
-index b81e2e14..63533444 100644
+index b81e2e14..887ff228 100644
 --- a/QuartzCore/CAMetalLayer.mm
 +++ b/QuartzCore/CAMetalLayer.mm
-@@ -25,7 +25,79 @@
+@@ -25,7 +25,90 @@
  #import <QuartzCore/CALayerContext.h>
  #import <Metal/stubs.h>
  
 +// Wait-site counters (flag file /tmp/metal-debug-waits, checked once at process start): the same summary the Indium
 +// hand-off waits write, so the drawable hand-out and the command-buffer hand-offs appear in one histogram.
 +#include <indium/waits.private.hpp>
++#include <indium/direct-diag.private.hpp>
++#include "CAMetalDirectSupport.h"
++
++@interface CALayerContext (DarlingDirectPresentation)
++- (BOOL) _directPresentationDisplay: (void **) display window: (unsigned long *) window frame: (CGRect *) frame;
++- (CALayer *) _directRootLayer;
++@end
++
 +
  #include <algorithm>
++#include <chrono>
++#include <pthread.h>
++#include <cstring>
 +#include <cstdio>
 +#include <unistd.h>
 +#include <map>
@@ -10556,7 +10629,7 @@ index b81e2e14..63533444 100644
  
  #import "CALayerInternal.h"
  
-@@ -205,6 +277,65 @@ static void reportGLErrors(void) {
+@@ -205,6 +288,81 @@ static void reportGLErrors(void) {
  
  @end
  
@@ -10619,12 +10692,67 @@ index b81e2e14..63533444 100644
 +}
 +}
 +
++// darling-lol (direct presentation prototype): the direct path's present requests go through the same opt-in sampler
++// as -queuePresent: (the replay scorer's present point). Called on the submit worker where the legacy path calls
++// -queuePresent:, i.e. right after the presenting command buffer's submission; done = vkQueuePresentKHR returned.
++void* CAMetalPresentIntervalBegin() {
++	return beginPresentIntervalSample();
++}
++
++void CAMetalPresentIntervalDone(void* opaque) {
++	auto* sample = static_cast<PresentIntervalSample*>(opaque);
++	if (!sample) return;
++	const int64_t now = presentIntervalNow();
++	sample->renderStart.store(now);
++	sample->renderDone.store(now);
++	sample->flushDone.store(now, std::memory_order_release);
++}
++
  @implementation CAMetalLayerInternal
  
  #if DARLING_METAL_ENABLED
-@@ -363,12 +494,15 @@ static void reportGLErrors(void) {
+@@ -232,6 +390,10 @@ static void reportGLErrors(void) {
+ 		_developerHUDProperties = [NSDictionary new];
+ 
+ 		_drawableCondition = [NSCondition new];
++
++		if (CAMetalDirectEnabled()) {
++			_direct = CAMetalDirectCreateState();
++		}
+ 	}
+ 	return self;
+ }
+@@ -362,13 +524,43 @@ static void reportGLErrors(void) {
+ 
  - (id<CAMetalDrawable>)nextDrawable
  {
++	if (_direct) {
++		// darling-lol (direct presentation prototype): decided here, before anything is acquired. NotActive or Failed
++		// take the legacy pool below; TimedOut returns nil, as the legacy pool does after its wait.
++		const auto deadline = std::chrono::steady_clock::now() + (_allowsNextDrawableTimeout ? std::chrono::seconds(1) : std::chrono::hours(24));
++		if (pthread_main_np() && CAMetalDirectStateOf(_direct) == CAMetalDirect::State::Activating) {
++			// The application renders on the main thread: the legacy frames that must drain before activation are
++			// composited by this thread, so finish the activation here instead of waiting for the main queue.
++			[self _directDrive];
++		}
++		CAMetalDirect::AcquireResult result;
++		id<CAMetalDrawable> direct = CAMetalDirectNextDrawable(_direct, self, deadline, result);
++		if (direct) {
++			if (_directSuboptimalRecreations == 0 && CAMetalDirectSuboptimal(_direct)) {
++				// Once per layer: a new swapchain lets the WSI pick buffers the server can flip; if it stays suboptimal
++				// it is kept (it presents correctly, by a server-side copy).
++				_directSuboptimalRecreations = 1;
++				CAMetalDirectLog("layer %p: swapchain suboptimal (server copy); recreating it once", self);
++				[self _directContextChanged];
++			}
++			return direct;
++		}
++		if (result == CAMetalDirect::AcquireResult::TimedOut) {
++			return nil;
++		}
++		[self _directScheduleDrive];
++	}
++	Indium::DirectDiag::count("legacy.nextDrawable");
  	std::shared_ptr<CAMetalDrawableActual> drawable = nullptr;
 +	CFTimeInterval waitStart = CACurrentMediaTime();
  
@@ -10638,7 +10766,7 @@ index b81e2e14..63533444 100644
  		if (_allowsNextDrawableTimeout) {
  			if (![_drawableCondition waitUntilDate: endTime]) {
  				break;
-@@ -380,6 +514,8 @@ static void reportGLErrors(void) {
+@@ -380,6 +572,8 @@ static void reportGLErrors(void) {
  
  	if (_usableDrawablesBitmap == 0) {
  		// timeout reached
@@ -10647,7 +10775,7 @@ index b81e2e14..63533444 100644
  		[_drawableCondition unlock];
  		return nil;
  	}
-@@ -400,6 +536,8 @@ static void reportGLErrors(void) {
+@@ -400,6 +594,8 @@ static void reportGLErrors(void) {
  	}
  
  	_usableDrawablesBitmap &= ~(1u << drawableID);
@@ -10656,7 +10784,7 @@ index b81e2e14..63533444 100644
  
  	drawable = _drawables[drawableID];
  
-@@ -410,20 +548,36 @@ static void reportGLErrors(void) {
+@@ -410,20 +606,43 @@ static void reportGLErrors(void) {
  
  - (void)queuePresent: (NSUInteger)drawableID
  {
@@ -10674,7 +10802,11 @@ index b81e2e14..63533444 100644
 -	[self display];
 +    // Present only after the Vulkan/GL synchronization has been prepared, on
 +    // the window thread. display alone does not drive the layer compositor.
++    Indium::DirectDiag::count("legacy.queuePresent");
++    const uint64_t queuedAt = Indium::DirectDiag::enabled() ? Indium::DirectDiag::now() : 0;
 +    dispatch_async(dispatch_get_main_queue(), ^{
++        if (queuedAt) Indium::DirectDiag::record("legacy.queueToMainBlock", Indium::DirectDiag::now() - queuedAt);
++        Indium::DirectDiag::Span mainBlock("legacy.mainBlock");
 +        if (intervalSample) intervalSample->renderStart.store(presentIntervalNow());
 +        darlingMetalTrace("present-block-runs", 0, 0);
 +        CFTimeInterval blockStart = CACurrentMediaTime();
@@ -10682,7 +10814,10 @@ index b81e2e14..63533444 100644
 +        if (intervalSample) intervalSample->renderDone.store(presentIntervalNow());
 +        CFTimeInterval renderDone = CACurrentMediaTime();
 +        darlingMetalTiming("mainBlockRender", renderDone - blockStart);
-+        [self->_context flush];
++        {
++            Indium::DirectDiag::Span flush("legacy.flush");
++            [self->_context flush];
++        }
 +        if (intervalSample) intervalSample->flushDone.store(presentIntervalNow(), std::memory_order_release);
 +        darlingMetalTiming("mainBlockFlush", CACurrentMediaTime() - renderDone);
 +    });
@@ -10694,7 +10829,17 @@ index b81e2e14..63533444 100644
  	[_drawableCondition lock];
  	_usableDrawablesBitmap |= 1u << drawableID;
  	[_drawableCondition signal];
-@@ -455,7 +609,7 @@ static void reportGLErrors(void) {
+@@ -432,6 +651,9 @@ static void reportGLErrors(void) {
+ 
+ - (void)recreateDrawables
+ {
++	// A drawable property (size, format, device, count) changed: a direct swapchain no longer matches.
++	[self _directContextChanged];
++
+ 	[_drawableCondition lock];
+ 
+ 	// drop all queued presentations
+@@ -455,7 +677,7 @@ static void reportGLErrors(void) {
  	}
  	_usableDrawablesBitmap = 0;
  
@@ -10703,7 +10848,7 @@ index b81e2e14..63533444 100644
  		// can't create new drawables
  		[_drawableCondition unlock];
  		return;
-@@ -506,6 +660,10 @@ static void reportGLErrors(void) {
+@@ -506,6 +728,10 @@ static void reportGLErrors(void) {
  			glTextureParameteri(_tex, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
  			glTextureParameteri(_tex, GL_TEXTURE_WRAP_S, GL_REPEAT);
  			glTextureParameteri(_tex, GL_TEXTURE_WRAP_T, GL_REPEAT);
@@ -10714,7 +10859,7 @@ index b81e2e14..63533444 100644
  			reportGLErrors();
  		}
  	}
-@@ -516,6 +674,10 @@ static void reportGLErrors(void) {
+@@ -516,6 +742,10 @@ static void reportGLErrors(void) {
  - (void)prepareRender
  {
  	std::shared_ptr<CAMetalDrawableActual> drawable = nullptr;
@@ -10725,12 +10870,16 @@ index b81e2e14..63533444 100644
  
  	[_drawableCondition lock];
  	if (_queuedDrawableCount > 0) {
-@@ -528,11 +690,62 @@ static void reportGLErrors(void) {
+@@ -528,11 +758,66 @@ static void reportGLErrors(void) {
  	if (drawable) {
  		// wait for the drawable to be fully rendered before copying it to the render texture
  		// (this is a GPU-side wait)
+-		drawable->synchronizeRender();
 +		CFTimeInterval syncStart = CACurrentMediaTime();
- 		drawable->synchronizeRender();
++		{
++			Indium::DirectDiag::Span sync("legacy.synchronizeRender");
++			drawable->synchronizeRender();
++		}
 +		darlingMetalTiming("synchronizeRender", CACurrentMediaTime() - syncStart);
  
 +		reportGLErrors();
@@ -10752,6 +10901,7 @@ index b81e2e14..63533444 100644
 +		}
  		reportGLErrors();
  		glCopyImageSubData(drawable->texture()->glTexture(), GL_TEXTURE_2D, 0, 0, 0, 0, _tex, GL_TEXTURE_2D, 0, 0, 0, 0, _drawableSize.width, _drawableSize.height, 1);
++		Indium::DirectDiag::count("legacy.glCopyImageSubData");
  		reportGLErrors();
 +
 +		// Diagnostic: every 150th presented frame, log pixel statistics of what is about to be shown
@@ -10788,8 +10938,13 @@ index b81e2e14..63533444 100644
  	}
  
  	@synchronized(self) {
-@@ -575,6 +788,11 @@ static void reportGLErrors(void) {
+@@ -573,8 +858,16 @@ static void reportGLErrors(void) {
+ 
+ - (void)_setContext: (CALayerContext*)context
  {
++	if (context != _context) {
++		[self _directWindowWillChange];
++	}
  	[super _setContext: context];
  
 +    if (!context || !context.glContext) {
@@ -10800,7 +10955,7 @@ index b81e2e14..63533444 100644
  	if (_tex == 0) {
  		// create our textures now using the context's CGLContext
  		CGLContextObj prev = CGLGetCurrentContext();
-@@ -589,10 +807,15 @@ static void reportGLErrors(void) {
+@@ -589,10 +882,295 @@ static void reportGLErrors(void) {
  		glTextureParameteri(_tex, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
  		glTextureParameteri(_tex, GL_TEXTURE_WRAP_S, GL_REPEAT);
  		glTextureParameteri(_tex, GL_TEXTURE_WRAP_T, GL_REPEAT);
@@ -10813,6 +10968,286 @@ index b81e2e14..63533444 100644
  		CGLSetCurrentContext(prev);
  	}
 +    [self recreateDrawables];
++}
++
++//
++// darling-lol: direct presentation prototype (guest flag /tmp/metal-direct-present)
++//
++// The layer presents through a Vulkan swapchain on its context's X11 window when it is the context's root layer,
++// fills the window exactly (drawable size = window size) and nothing else would be composited. Only the main thread
++// changes the state: Inactive -> Activating (swapchain created; legacy frames still drain) -> Active (only the
++// swapchain writes the window) -> Draining (no new acquisitions; images come back) -> Inactive.
++
++- (BOOL)_directOwnsWindow
++{
++	if (!_direct) return NO;
++	const auto state = CAMetalDirectStateOf(_direct);
++	return state == CAMetalDirect::State::Active || state == CAMetalDirect::State::Draining;
++}
++
++- (void)_directScheduleDrive
++{
++	if (!_direct || _directDriveScheduled.exchange(true)) return;
++	[self retain];
++	dispatch_async(dispatch_get_main_queue(), ^{
++		self->_directDriveScheduled = false;
++		[self _directDrive];
++		[self release];
++	});
++}
++
++- (void)_directScheduleDriveAfter: (double)seconds
++{
++	if (!_direct) return;
++	[self retain];
++	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) (seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++		[self _directDrive];
++		[self release];
++	});
++}
++
++// Any thread: something the eligibility or the swapchain depends on changed.
++- (void)_directContextChanged
++{
++	if (!_direct) return;
++	const auto state = CAMetalDirectStateOf(_direct);
++	if (state != CAMetalDirect::State::Inactive) {
++		CAMetalDirectRevoke(_direct);
++		CAMetalDirectLog("layer %p revoked (was %s)", self, CAMetalDirect::describe(state));
++	}
++	[self _directScheduleDrive];
++}
++
++// Main thread: the context's window is about to be destroyed or replaced. Retire the swapchain first (bounded).
++- (void)_directWindowWillChange
++{
++	if (!_direct || CAMetalDirectStateOf(_direct) == CAMetalDirect::State::Inactive) return;
++	CAMetalDirectRevoke(_direct);
++	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
++	while (!CAMetalDirectTryRetire(_direct)) {
++		if (std::chrono::steady_clock::now() >= deadline) {
++			CAMetalDirectLog("layer %p: window changes while the swapchain is still in use (1000 ms)", self);
++			return;
++		}
++		usleep(1000);
++	}
++	CAMetalDirectLogCounters(_direct, "retired before a window change");
++}
++
++static bool directSublayerShowsNothing(CALayer* sublayer)
++{
++	if (sublayer.hidden) return true;
++	const CGSize size = sublayer.bounds.size;
++	return (!(size.width > 0) || !(size.height > 0)) && [[sublayer sublayers] count] == 0 && !(sublayer.shadowOpacity > 0);
++}
++
++// Main thread. Fills `target` when the layer may present directly now; otherwise returns the reason.
++- (const char*)_directEligibility: (CAMetalDirectTarget&)target
++{
++	CALayerContext* context = _context;
++	if (!_device) return "no device";
++	if (!context || !context.glContext) return "no context";
++	if ([context _directRootLayer] != self || self.superlayer != nil) return "not the context's root layer";
++	for (CALayer* sublayer in [self sublayers]) {
++		if (!directSublayerShowsNothing(sublayer)) return "has a visible sublayer";
++	}
++	if (_presentsWithTransaction) return "presentsWithTransaction";
++	if (self.hidden || self.opacity < 1.0) return "hidden or translucent";
++	const CATransform3D sublayerTransform = self.sublayerTransform;
++	if (memcmp(&sublayerTransform, &CATransform3DIdentity, sizeof(CATransform3D)) != 0) return "sublayer transform";
++	if ([[self animationKeys] count] > 0) return "animated";
++	void* display = nullptr;
++	unsigned long window = 0;
++	CGRect frame = CGRectZero;
++	if (![context _directPresentationDisplay: &display window: &window frame: &frame]) return "no native X11 window";
++	const CGRect layerFrame = self.frame;
++	if (layerFrame.origin.x != 0 || layerFrame.origin.y != 0 || layerFrame.size.width != frame.size.width || layerFrame.size.height != frame.size.height) {
++		return "layer does not fill its window";
++	}
++	if (_drawableSize.width != frame.size.width || _drawableSize.height != frame.size.height) return "drawable size differs from the window";
++	switch (_pixelFormat) {
++		case MTLPixelFormatBGRA8Unorm:      target.pixelFormat = Indium::PixelFormat::BGRA8Unorm;      break;
++		case MTLPixelFormatBGRA8Unorm_sRGB: target.pixelFormat = Indium::PixelFormat::BGRA8Unorm_sRGB; break;
++		default: return "pixel format not supported by the direct path";
++	}
++	target.display = display;
++	target.window = window;
++	target.width = (uint32_t) _drawableSize.width;
++	target.height = (uint32_t) _drawableSize.height;
++	target.framebufferOnly = _framebufferOnly;
++	target.displaySync = _displaySyncEnabled;
++	target.maxDrawables = (uint32_t) _maximumDrawableCount;
++	target.device = std::dynamic_pointer_cast<Indium::PrivateDevice>(((MTLDeviceInternal*) _device).device);
++	return nullptr;
++}
++
++// Main thread: advance the state machine.
++- (void)_directDrive
++{
++	if (!_direct) return;
++	switch (CAMetalDirectStateOf(_direct)) {
++		case CAMetalDirect::State::Inactive: {
++			const CFTimeInterval now = CACurrentMediaTime();
++			if (now - _directLastEvaluation < 0.5) {
++				return; // re-evaluated by the next nextDrawable or property change after this
++			}
++			_directLastEvaluation = now;
++			CAMetalDirectTarget target;
++			if (const char* reason = [self _directEligibility: target]) {
++				static const char* lastReason = nullptr;
++				if (reason != lastReason) CAMetalDirectLog("layer %p not eligible: %s", self, reason);
++				lastReason = reason;
++				return;
++			}
++			std::string reason;
++			if (!CAMetalDirectBeginActivation(_direct, target, reason)) {
++				CAMetalDirectLog("layer %p stays on the legacy path: %s", self, reason.c_str());
++				return;
++			}
++			_directActivationStart = now;
++			CAMetalDirectLog("layer %p activating: window 0x%lx %ux%u", self, target.window, target.width, target.height);
++			// fall through to the activation check
++		}
++		case CAMetalDirect::State::Activating: {
++			// Legacy frames accepted before go through the legacy writer first.
++			[_drawableCondition lock];
++			const bool queued = _queuedDrawableCount > 0;
++			[_drawableCondition unlock];
++			if (queued) {
++				[_context render];
++				[_context flush];
++			}
++			@synchronized(self) {
++				// The last legacy frame was composited and swapped; its drawable is only released when the next one
++				// is composited, which will not happen now.
++				if (_lastPresentedDrawable && !queued) {
++					_lastPresentedDrawable->didPresent();
++					_lastPresentedDrawable = nullptr;
++				}
++			}
++			[_drawableCondition lock];
++			const uint8_t all = (uint8_t) ((1u << _maximumDrawableCount) - 1);
++			const bool idle = _queuedDrawableCount == 0 && (_usableDrawablesBitmap & all) == all;
++			[_drawableCondition unlock];
++			if (idle) {
++				CAMetalDirectCompleteActivation(_direct);
++				CAMetalDirectLog("layer %p active after %.1f ms", self, (CACurrentMediaTime() - _directActivationStart) * 1000);
++				return;
++			}
++			if (CACurrentMediaTime() - _directActivationLogged > 0.25) {
++				_directActivationLogged = CACurrentMediaTime();
++				[_drawableCondition lock];
++				CAMetalDirectLog("layer %p activating: waiting for legacy frames (queued %lu, free drawables 0x%x of 0x%x, last presented %d)", self,
++					(unsigned long) _queuedDrawableCount, (unsigned) _usableDrawablesBitmap, (unsigned) all, _lastPresentedDrawable != nullptr);
++				[_drawableCondition unlock];
++			}
++			if (CACurrentMediaTime() - _directActivationStart > 1.0) {
++				CAMetalDirectRevoke(_direct);
++				CAMetalDirectLog("layer %p: legacy frames still outstanding after 1 s; activation abandoned", self);
++				return;
++			}
++			[self _directScheduleDriveAfter: 0.001];
++			return;
++		}
++		case CAMetalDirect::State::Active:
++			return;
++		case CAMetalDirect::State::Draining: {
++			if (_directDrainStart == 0) {
++				_directDrainStart = CACurrentMediaTime();
++				_directDrainLogged = NO;
++			}
++			if (CAMetalDirectTryRetire(_direct)) {
++				CAMetalDirectLog("layer %p retired its swapchain after %.1f ms", self, (CACurrentMediaTime() - _directDrainStart) * 1000);
++				CAMetalDirectLogCounters(_direct, "retired");
++				_directDrainStart = 0;
++				// Legacy frames acquired while draining were not drawn.
++				[_drawableCondition lock];
++				const bool queued = _queuedDrawableCount > 0;
++				[_drawableCondition unlock];
++				if (queued) {
++					[_context render];
++					[_context flush];
++				}
++				_directLastEvaluation = 0;
++				[self _directScheduleDrive];
++				return;
++			}
++			if (!_directDrainLogged && CACurrentMediaTime() - _directDrainStart > 2.0) {
++				_directDrainLogged = YES;
++				CAMetalDirectLog("layer %p: swapchain still in use after 2 s of draining", self);
++			}
++			[self _directScheduleDriveAfter: 0.002];
++			return;
++		}
++	}
++}
++
++// Properties the eligibility depends on (the layer-tree mutations of the root layer).
++- (void)setSublayers: (NSArray*)sublayers
++{
++	[super setSublayers: sublayers];
++	[self _directContextChanged];
++}
++
++- (void)setHidden: (BOOL)hidden
++{
++	const BOOL old = self.hidden;
++	[super setHidden: hidden];
++	if (old != hidden) [self _directContextChanged];
++}
++
++- (void)setOpacity: (CGFloat)opacity
++{
++	const CGFloat old = self.opacity;
++	[super setOpacity: opacity];
++	if (old != opacity) [self _directContextChanged];
++}
++
++- (void)setBounds: (CGRect)bounds
++{
++	const CGRect old = self.bounds;
++	[super setBounds: bounds];
++	if (!CGRectEqualToRect(old, bounds)) [self _directContextChanged];
++}
++
++- (void)setPosition: (CGPoint)position
++{
++	const CGPoint old = self.position;
++	[super setPosition: position];
++	if (!CGPointEqualToPoint(old, position)) [self _directContextChanged];
++}
++
++- (void)setAnchorPoint: (CGPoint)anchorPoint
++{
++	const CGPoint old = self.anchorPoint;
++	[super setAnchorPoint: anchorPoint];
++	if (!CGPointEqualToPoint(old, anchorPoint)) [self _directContextChanged];
++}
++
++- (void)setSublayerTransform: (CATransform3D)transform
++{
++	[super setSublayerTransform: transform];
++	[self _directContextChanged];
++}
++
++- (void)addAnimation: (CAAnimation*)animation forKey: (NSString*)key
++{
++	[super addAnimation: animation forKey: key];
++	[self _directContextChanged];
++}
++
++- (void)setDisplaySyncEnabled: (BOOL)displaySyncEnabled
++{
++	const BOOL changed = _displaySyncEnabled != displaySyncEnabled;
++	_displaySyncEnabled = displaySyncEnabled;
++	if (changed) [self _directContextChanged];
++}
++
++- (void)setPresentsWithTransaction: (BOOL)presentsWithTransaction
++{
++	const BOOL changed = _presentsWithTransaction != presentsWithTransaction;
++	_presentsWithTransaction = presentsWithTransaction;
++	if (changed) [self _directContextChanged];
  }
  
  #else
@@ -11199,10 +11634,18 @@ index 444122cc..81b01703 100644
 +@implementation CATransformLayer
  @end
 diff --git a/QuartzCore/CMakeLists.txt b/QuartzCore/CMakeLists.txt
-index bc12fb7f..3ab43fd7 100644
+index bc12fb7f..2e999b0f 100644
 --- a/QuartzCore/CMakeLists.txt
 +++ b/QuartzCore/CMakeLists.txt
-@@ -100,6 +100,7 @@ add_framework(QuartzCore
+@@ -64,6 +64,7 @@ set(QuartzCore_sources
+ 	CAOpenGLLayer.m
+ 	CAMetalLayer.mm
+ 	CAMetalDrawable.mm
++	CAMetalDirectPresent.mm
+ 	CASpringAnimation.m
+ 	CATransformLayer.m
+ )
+@@ -100,6 +101,7 @@ add_framework(QuartzCore
  		Onyx2D
  		OpenGL
  		CoreGraphics
@@ -11210,7 +11653,7 @@ index bc12fb7f..3ab43fd7 100644
  		Metal_private
  		${QUARTZCORE_LINK_INDIUM_PRIVATE}
  		cxx
-@@ -116,7 +117,7 @@ set_target_properties(QuartzCore
+@@ -116,7 +118,7 @@ set_target_properties(QuartzCore
  		CXX_STANDARD_REQUIRED ON
  )
  
@@ -11730,3 +12173,1349 @@ index 65b63a3e..e5b913b1 100644
  }
  
  - initWithParentWindow: (X11Window *) parent frame: (CGRect) frame;
+diff --git a/QuartzCore/CAMetalDirectPresent.h b/QuartzCore/CAMetalDirectPresent.h
+new file mode 100644
+index 00000000..dbfdf1b3
+--- /dev/null
++++ b/QuartzCore/CAMetalDirectPresent.h
+@@ -0,0 +1,347 @@
++/*
++ * This file is part of Darling.
++ *
++ * Copyright (C) 2026 Darling developers
++ *
++ * Darling is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Darling is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Darling.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// darling-lol (prototype): direct presentation of CAMetalLayer drawables through a Vulkan swapchain.
++//
++// The drawable texture IS the acquired swapchain image: nextDrawable acquires it, the game renders into it, and the
++// presenting command buffer's commit (on Indium's existing submit worker, after its vkQueueSubmit2) submits a layout
++// transition that signals a binary semaphore and calls vkQueuePresentKHR. The driver's WSI owns the image pool and the
++// presentation queue; no thread of ours consumes frames.
++//
++// Plain C++17 over a Platform (the real one wraps Vulkan in CAMetalDrawable.mm; tests use a fake). What this core keeps:
++//   - one swapchain ("chain") per activation; images of a retired chain are still presented or given back to it;
++//   - a bound on images the application holds (maxHeld = maximumDrawableCount): the chain is created with at least
++//     minImageCount + maxHeld - 1 images, so an acquire while holding fewer than maxHeld images is guaranteed to
++//     make progress without another present (vkAcquireNextImageKHR forward-progress rule);
++//   - acquisition never blocks inside the driver with a lock of ours held: it polls with timeout 0 and waits on our
++//     condition (woken by every present) until its deadline;
++//   - images acquired but never presented stay acquired and are handed out again ("spare"); when a chain retires they
++//     are given back (vkReleaseSwapchainImagesEXT) only once the GPU no longer uses them;
++//   - retirement (destroying a chain) waits until every image is back and every present fence of the chain signalled.
++//     A present fence means the present's resources may be reused/destroyed, not that the frame was displayed.
++// States: Inactive -> Activating (chain created, legacy frames still drain) -> Active -> Draining -> Inactive.
++// The legacy compositor may write the window only in Inactive and Activating.
++
++#pragma once
++
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <vector>
++
++namespace CAMetalDirect {
++
++enum class State : uint8_t { Inactive, Activating, Active, Draining };
++enum class AcquireResult : uint8_t { Acquired, NotActive, TimedOut, Failed };
++// Platform::tryAcquire / present results
++enum class Status : uint8_t { Ok, NotReady, OutOfDate, Error };
++
++inline const char* describe(State state) {
++	switch (state) {
++		case State::Inactive: return "inactive";
++		case State::Activating: return "activating";
++		case State::Active: return "active";
++		case State::Draining: return "draining";
++	}
++	return "?";
++}
++
++// Platform requirements (Chain is the platform's swapchain object; the core only stores shared_ptrs):
++//   Status tryAcquire(Chain&, uint32_t& index)          non-blocking (timeout 0), under the chain's host lock
++//   bool prepareAcquired(Chain&, uint32_t index)        GPU: wait for the acquire, transition the image for use
++//   Status present(Chain&, uint32_t index)              GPU: transition + ready signal after all prior work; present
++//   bool presentsComplete(Chain&)                       every present fence of the chain signalled (non-blocking)
++//   bool imagesIdle(Chain&, const std::vector<uint32_t>&)  no GPU work uses these images any more (non-blocking)
++//   void retire(Chain&, const std::vector<uint32_t>& spare)  give back spare images, destroy the swapchain
++//   void waitForProgress(std::unique_lock<std::mutex>&, std::condition_variable&, deadline)  (bounded wait, tests may fake)
++template<class Platform>
++class Presenter {
++public:
++	using Chain = typename Platform::Chain;
++	using Clock = std::chrono::steady_clock;
++
++	struct Image {
++		std::shared_ptr<Chain> chain;
++		uint32_t index = UINT32_MAX;
++		uint64_t generation = 0;
++		explicit operator bool() const { return chain != nullptr; }
++	};
++
++	struct Counters {
++		uint64_t acquired = 0, reusedSpare = 0, acquireTimeouts = 0, acquireFailures = 0, notActive = 0;
++		uint64_t presented = 0, presentFailures = 0, abandoned = 0, activations = 0, retirements = 0, revocations = 0;
++		uint64_t acquirePolls = 0;
++	};
++
++	explicit Presenter(Platform& platform): _platform(platform) {}
++
++	State state() {
++		std::lock_guard<std::mutex> lock(_mutex);
++		return _state;
++	}
++
++	Counters counters() {
++		std::lock_guard<std::mutex> lock(_mutex);
++		return _counters;
++	}
++
++	// Main thread: a new chain for this layer. Legacy frames may still be in flight; completeActivation() follows.
++	bool beginActivation(std::shared_ptr<Chain> chain, uint32_t maxHeld) {
++		std::lock_guard<std::mutex> lock(_mutex);
++		if (_state != State::Inactive || !chain || maxHeld == 0) return false;
++		_chain = std::move(chain);
++		_maxHeld = maxHeld;
++		_held = 0;
++		_spare.clear();
++		++_generation;
++		_state = State::Activating;
++		return true;
++	}
++
++	// Main thread, once no legacy frame is outstanding: from now on only this chain writes the window.
++	bool completeActivation() {
++		{
++			std::lock_guard<std::mutex> lock(_mutex);
++			if (_state != State::Activating) return false;
++			_state = State::Active;
++			++_counters.activations;
++		}
++		_condition.notify_all();
++		return true;
++	}
++
++	// Any thread: stop handing out images of the current chain. Activating ends at once (nothing was acquired);
++	// Active starts draining. Returns the state after the call.
++	State revoke() {
++		std::shared_ptr<Chain> abandoned;
++		State result;
++		{
++			std::lock_guard<std::mutex> lock(_mutex);
++			if (_state == State::Activating) {
++				abandoned = std::move(_chain);
++				_state = State::Inactive;
++				++_counters.revocations;
++			} else if (_state == State::Active) {
++				_state = State::Draining;
++				++_counters.revocations;
++			}
++			result = _state;
++		}
++		_condition.notify_all();
++		if (abandoned) {
++			_platform.retire(*abandoned, {});
++		}
++		return result;
++	}
++
++	// Main thread (or the exit handler): Draining -> Inactive once nothing of the chain is in use. Non-blocking.
++	bool tryRetire() {
++		std::shared_ptr<Chain> chain;
++		std::vector<uint32_t> spare;
++		{
++			std::lock_guard<std::mutex> lock(_mutex);
++			if (_state != State::Draining) return _state == State::Inactive;
++			if (_held != 0) return false;
++			chain = _chain;
++			spare = _spare;
++		}
++		if (!_platform.presentsComplete(*chain) || !_platform.imagesIdle(*chain, spare)) return false;
++		{
++			std::lock_guard<std::mutex> lock(_mutex);
++			if (_state != State::Draining || _held != 0 || _chain != chain) return false;
++			_chain = nullptr;
++			_spare.clear();
++			_state = State::Inactive;
++			++_counters.retirements;
++		}
++		_platform.retire(*chain, spare);
++		_condition.notify_all();
++		return true;
++	}
++
++	// Application thread (nextDrawable). Acquired: `out` is an image of the active chain. NotActive: no direct
++	// presentation now (the caller takes the legacy path; decided before any acquisition). TimedOut: the deadline
++	// passed (the caller returns nil, as the legacy pool does). Failed: the swapchain failed; it is being revoked.
++	AcquireResult acquire(Image& out, Clock::time_point deadline) {
++		std::unique_lock<std::mutex> lock(_mutex);
++		for (;;) {
++			if (_state == State::Activating) {
++				// Legacy frames drain first; the main thread activates or gives up.
++				if (_condition.wait_until(lock, deadline) == std::cv_status::timeout && _state == State::Activating) {
++					++_counters.acquireTimeouts;
++					return AcquireResult::TimedOut;
++				}
++				continue;
++			}
++			if (_state != State::Active) {
++				++_counters.notActive;
++				return AcquireResult::NotActive;
++			}
++			if (_held >= _maxHeld) {
++				if (_condition.wait_until(lock, deadline) == std::cv_status::timeout && _held >= _maxHeld && _state == State::Active) {
++					++_counters.acquireTimeouts;
++					return AcquireResult::TimedOut;
++				}
++				continue;
++			}
++			break;
++		}
++		auto chain = _chain;
++		const uint64_t generation = _generation;
++		++_held;
++		if (!_spare.empty()) {
++			out.chain = chain;
++			out.index = _spare.back();
++			out.generation = generation;
++			_spare.pop_back();
++			++_counters.reusedSpare;
++			++_counters.acquired;
++			return AcquireResult::Acquired;
++		}
++		for (;;) {
++			lock.unlock();
++			uint32_t index = UINT32_MAX;
++			const Status status = _platform.tryAcquire(*chain, index);
++			lock.lock();
++			if (status == Status::Ok) {
++				lock.unlock();
++				const bool prepared = _platform.prepareAcquired(*chain, index);
++				lock.lock();
++				if (!prepared) {
++					// The image is acquired but unusable: keep it with the chain and fail this acquisition.
++					_spare.push_back(index);
++					--_held;
++					++_counters.acquireFailures;
++					revokeLocked();
++					lock.unlock();
++					_condition.notify_all();
++					return AcquireResult::Failed;
++				}
++				// _chain cannot have changed: a chain retires only with _held == 0, and this acquisition is counted.
++				out.chain = chain;
++				out.index = index;
++				out.generation = generation;
++				++_counters.acquired;
++				if (_state != State::Active) {
++					// Revoked while acquiring (same chain, now draining): hand it back as spare.
++					_spare.push_back(index);
++					--_held;
++					out = Image {};
++					++_counters.notActive;
++					lock.unlock();
++					_condition.notify_all();
++					return AcquireResult::NotActive;
++				}
++				return AcquireResult::Acquired;
++			}
++			if (status != Status::NotReady) {
++				--_held;
++				++_counters.acquireFailures;
++				revokeLocked();
++				lock.unlock();
++				_condition.notify_all();
++				return AcquireResult::Failed;
++			}
++			if (_state != State::Active || Clock::now() >= deadline) {
++				--_held;
++				const bool timedOut = _state == State::Active;
++				++(timedOut ? _counters.acquireTimeouts : _counters.notActive);
++				lock.unlock();
++				_condition.notify_all();
++				return timedOut ? AcquireResult::TimedOut : AcquireResult::NotActive;
++			}
++			// No image yet: every present wakes us; bounded so a lost wakeup costs at most one poll interval.
++			++_counters.acquirePolls;
++			_platform.waitForProgress(lock, _condition, std::min(deadline, Clock::now() + std::chrono::milliseconds(1)));
++		}
++	}
++
++	// Application thread: an acquired image that will never be presented (its drawable was released). It stays
++	// acquired and is handed out again (or given back when its chain retires).
++	void abandon(const Image& image) {
++		{
++			std::lock_guard<std::mutex> lock(_mutex);
++			if (image.chain == _chain) {
++				_spare.push_back(image.index);
++			} else {
++				// A chain already retired cannot have held images (retirement waits for _held == 0).
++				_lostSpare = true;
++			}
++			--_held;
++			++_counters.abandoned;
++		}
++		_condition.notify_all();
++	}
++
++	// Submit worker (the presenting command buffer's commit, after its submission). Never blocks on our condition.
++	Status present(const Image& image) {
++		const Status status = _platform.present(*image.chain, image.index);
++		{
++			std::lock_guard<std::mutex> lock(_mutex);
++			--_held;
++			if (status == Status::Ok) {
++				++_counters.presented;
++			} else {
++				++_counters.presentFailures;
++				if (image.chain == _chain) revokeLocked();
++			}
++		}
++		_condition.notify_all();
++		return status;
++	}
++
++	std::shared_ptr<Chain> currentChain() {
++		std::lock_guard<std::mutex> lock(_mutex);
++		return _chain;
++	}
++
++	uint32_t held() {
++		std::lock_guard<std::mutex> lock(_mutex);
++		return _held;
++	}
++
++	bool lostSpare() {
++		std::lock_guard<std::mutex> lock(_mutex);
++		return _lostSpare;
++	}
++
++private:
++	void revokeLocked() {
++		if (_state == State::Active) {
++			_state = State::Draining;
++			++_counters.revocations;
++		}
++	}
++
++	Platform& _platform;
++	std::mutex _mutex;
++	std::condition_variable _condition;
++	State _state = State::Inactive;
++	std::shared_ptr<Chain> _chain;
++	std::vector<uint32_t> _spare;
++	uint32_t _maxHeld = 0;
++	uint32_t _held = 0;
++	uint64_t _generation = 0;
++	bool _lostSpare = false;
++	Counters _counters;
++};
++
++} // namespace CAMetalDirect
+diff --git a/QuartzCore/CAMetalDirectPresent.mm b/QuartzCore/CAMetalDirectPresent.mm
+new file mode 100644
+index 00000000..dd3360bb
+--- /dev/null
++++ b/QuartzCore/CAMetalDirectPresent.mm
+@@ -0,0 +1,876 @@
++/*
++ * This file is part of Darling.
++ *
++ * Copyright (C) 2026 Darling developers
++ *
++ * Darling is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Darling is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Darling.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// darling-lol (prototype): Vulkan platform of CAMetalDirect::Presenter (see CAMetalDirectPresent.h) and the drawable
++// object the application gets in direct mode. The swapchain is created with VK_KHR_xlib_surface on the X11 window the
++// legacy compositor would draw into; Mesa's WSI owns the images, the X Present traffic and its own threads.
++
++#import "CAMetalDirectSupport.h"
++#import <QuartzCore/CAMetalDrawable.h>
++#import <Metal/MTLDrawableInternal.h>
++#import <Metal/MTLTextureInternal.h>
++#import <Metal/MTLDeviceInternal.h>
++#import <Metal/stubs.h>
++#import <Foundation/Foundation.h>
++
++#if DARLING_METAL_ENABLED
++
++#define VK_USE_PLATFORM_XLIB_KHR 1
++typedef struct _XDisplay Display;
++typedef unsigned long Window;
++typedef unsigned long VisualID;
++#include <vulkan/vulkan_xlib.h>
++
++#include <indium/indium.private.hpp>
++#include <indium/direct-diag.private.hpp>
++#include <indium/instance.private.hpp>
++#include <dispatch/dispatch.h>
++
++#include <atomic>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <thread>
++#include <vector>
++#include <unistd.h>
++
++namespace DynamicVK = Indium::DynamicVK;
++namespace Diag = Indium::DirectDiag;
++
++namespace {
++	// Not in Indium's eagerly resolved set: resolved once (at the first activation, never during exit).
++	DynamicVK::DynamicFunction<PFN_vkCreateXlibSurfaceKHR> vkCreateXlibSurfaceKHR("vkCreateXlibSurfaceKHR");
++	DynamicVK::DynamicFunction<PFN_vkGetPhysicalDeviceSurfaceSupportKHR> vkGetPhysicalDeviceSurfaceSupportKHR("vkGetPhysicalDeviceSurfaceSupportKHR");
++	DynamicVK::DynamicFunction<PFN_vkReleaseSwapchainImagesEXT> vkReleaseSwapchainImagesEXT("vkReleaseSwapchainImagesEXT");
++	DynamicVK::DynamicFunction<PFN_vkResetFences> vkResetFences("vkResetFences");
++	DynamicVK::DynamicFunction<PFN_vkGetFenceStatus> vkGetFenceStatus("vkGetFenceStatus");
++
++	bool resolveDirectFunctions() {
++		static const bool resolved = vkCreateXlibSurfaceKHR.resolve() && vkGetPhysicalDeviceSurfaceSupportKHR.resolve() &&
++			vkReleaseSwapchainImagesEXT.resolve() && vkResetFences.resolve() && vkGetFenceStatus.resolve();
++		return resolved;
++	}
++}
++
++bool CAMetalDirectEnabled() {
++	return Indium::directPresentationRequested();
++}
++
++void CAMetalDirectLog(const char* format, ...) {
++	if (FILE* log = fopen("/tmp/metal-direct-present.log", "a")) {
++		fprintf(log, "%.3f pid=%d ", CACurrentMediaTime(), getpid());
++		va_list args;
++		va_start(args, format);
++		vfprintf(log, format, args);
++		va_end(args);
++		fputc('\n', log);
++		fclose(log);
++	}
++}
++
++//
++// the drawable texture: an acquired swapchain image (not owned)
++//
++
++class CAMetalDirectTexture: public Indium::PrivateTexture {
++	VkImage _image;
++	VkImageView _view;
++	size_t _width, _height;
++	Indium::PixelFormat _pixelFormat;
++	bool _framebufferOnly;
++
++public:
++	CAMetalDirectTexture(std::shared_ptr<Indium::PrivateDevice> device, VkImage image, VkImageView view, size_t width, size_t height, Indium::PixelFormat pixelFormat, bool framebufferOnly):
++		Indium::PrivateTexture(device), _image(image), _view(view), _width(width), _height(height), _pixelFormat(pixelFormat), _framebufferOnly(framebufferOnly) {}
++	~CAMetalDirectTexture() override {}
++
++	VkImageView imageView() override { return _view; }
++	VkImage image() override { return _image; }
++	// Between the acquire transition and the present transition the image rests in GENERAL, like the legacy drawable,
++	// so every Metal use (render target, sampled, storage, blit) sees the layout Indium expects.
++	VkImageLayout imageLayout() override { return VK_IMAGE_LAYOUT_GENERAL; }
++	Indium::TextureType textureType() const override { return Indium::TextureType::e2D; }
++	Indium::PixelFormat pixelFormat() const override { return _pixelFormat; }
++	size_t width() const override { return _width; }
++	size_t height() const override { return _height; }
++	size_t depth() const override { return 1; }
++	size_t mipmapLevelCount() const override { return 1; }
++	size_t arrayLength() const override { return 1; }
++	size_t sampleCount() const override { return 1; }
++	bool framebufferOnly() const override { return false; } // as the legacy drawable texture reports
++	bool allowGPUOptimizedContents() const override { return true; }
++	bool shareable() const override { return false; }
++	Indium::TextureSwizzleChannels swizzle() const override { return {}; }
++	void replaceRegion(Indium::Region, size_t, const void*, size_t) override { abort(); }
++	void replaceRegion(Indium::Region, size_t, size_t, const void*, size_t, size_t) override { abort(); }
++	// No precommit copy and no exportable presentation semaphore: nothing outside Vulkan reads this image.
++
++	// Every tracked GPU use (render passes, blit writes) reserved a value of this texture's timeline.
++	bool gpuIdle() {
++		uint64_t target;
++		{
++			std::lock_guard<std::mutex> lock(_syncMutex);
++			target = _syncSemaphore->count;
++		}
++		uint64_t value = 0;
++		if (DynamicVK::vkGetSemaphoreCounterValue(_device->device(), _syncSemaphore->semaphore, &value) != VK_SUCCESS) {
++			return false;
++		}
++		return value >= target;
++	}
++};
++
++//
++// platform
++//
++
++struct CAMetalDirectChain {
++	std::shared_ptr<Indium::PrivateDevice> device;
++	VkSurfaceKHR surface = VK_NULL_HANDLE;
++	VkSwapchainKHR swapchain = VK_NULL_HANDLE;
++	VkFormat format = VK_FORMAT_UNDEFINED;
++	VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
++	uint32_t width = 0, height = 0;
++	uint32_t minImageCount = 0;
++	std::mutex hostMutex; // the swapchain's external host synchronization (acquire, present, release, destroy)
++	std::vector<VkImage> images;
++	std::vector<VkImageView> views;
++	std::vector<std::shared_ptr<CAMetalDirectTexture>> textures;
++	VkCommandPool pool = VK_NULL_HANDLE;
++	std::vector<VkCommandBuffer> toGeneral, toPresent; // per image, recorded once (simultaneous use)
++
++	struct AcquireSlot { VkSemaphore semaphore = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; bool busy = false; };
++	std::mutex acquireMutex;
++	std::vector<AcquireSlot> acquireSlots;
++	std::vector<uint32_t> imageSlot; // acquire slot of each image's last acquisition
++
++	// Present slots: under the device's queue mutex (presents happen there).
++	struct PresentSlot { VkSemaphore ready = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; bool submitted = false; bool poisoned = false; };
++	std::vector<PresentSlot> presentSlots;
++	uint32_t nextPresent = 0;
++	// VK_SUBOPTIMAL_KHR seen (Mesa's X11 WSI: the X server presented by copy where a reallocated swapchain could flip)
++	std::atomic<bool> suboptimal {false};
++};
++
++namespace {
++
++struct VulkanPlatform {
++	using Chain = CAMetalDirectChain;
++
++	CAMetalDirect::Status tryAcquire(Chain& chain, uint32_t& index) {
++		uint32_t slot = UINT32_MAX;
++		{
++			std::lock_guard<std::mutex> lock(chain.acquireMutex);
++			for (uint32_t i = 0; i < chain.acquireSlots.size(); ++i) {
++				auto& candidate = chain.acquireSlots[i];
++				if (candidate.busy && vkGetFenceStatus(chain.device->device(), candidate.fence) == VK_SUCCESS) {
++					vkResetFences(chain.device->device(), 1, &candidate.fence);
++					candidate.busy = false;
++				}
++				if (!candidate.busy) {
++					slot = i;
++					break;
++				}
++			}
++			if (slot == UINT32_MAX) {
++				Diag::count("direct.acquire.noSlot");
++				return CAMetalDirect::Status::NotReady;
++			}
++			chain.acquireSlots[slot].busy = true; // reserved; released below unless an image was acquired
++		}
++		VkResult result;
++		{
++			std::lock_guard<std::mutex> lock(chain.hostMutex);
++			Diag::Span span("direct.acquire.vkAcquireNextImageKHR");
++			result = DynamicVK::vkAcquireNextImageKHR(chain.device->device(), chain.swapchain, 0, chain.acquireSlots[slot].semaphore, VK_NULL_HANDLE, &index);
++		}
++		if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
++			if (result == VK_SUBOPTIMAL_KHR) {
++				Diag::count("direct.acquire.suboptimal");
++				chain.suboptimal = true;
++			}
++			std::lock_guard<std::mutex> lock(chain.acquireMutex);
++			chain.imageSlot[index] = slot;
++			return CAMetalDirect::Status::Ok;
++		}
++		{
++			std::lock_guard<std::mutex> lock(chain.acquireMutex);
++			chain.acquireSlots[slot].busy = false; // nothing was signalled or submitted with it
++		}
++		if (result == VK_NOT_READY || result == VK_TIMEOUT) return CAMetalDirect::Status::NotReady;
++		CAMetalDirectLog("acquire failed: VkResult %d", (int) result);
++		return result == VK_ERROR_OUT_OF_DATE_KHR ? CAMetalDirect::Status::OutOfDate : CAMetalDirect::Status::Error;
++	}
++
++	// GPU: wait for the acquire semaphore, then UNDEFINED -> GENERAL. Submitted from the acquiring thread, before any
++	// command buffer that uses the image (those are committed after nextDrawable returned, so later in submission
++	// order); the barrier's second scope covers them.
++	bool prepareAcquired(Chain& chain, uint32_t index) {
++		uint32_t slot;
++		{
++			std::lock_guard<std::mutex> lock(chain.acquireMutex);
++			slot = chain.imageSlot[index];
++		}
++		VkSemaphoreSubmitInfo wait {};
++		wait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
++		wait.semaphore = chain.acquireSlots[slot].semaphore;
++		wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++		VkCommandBufferSubmitInfo commands {};
++		commands.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
++		commands.commandBuffer = chain.toGeneral[index];
++		VkSubmitInfo2 submit {};
++		submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
++		submit.waitSemaphoreInfoCount = 1;
++		submit.pWaitSemaphoreInfos = &wait;
++		submit.commandBufferInfoCount = 1;
++		submit.pCommandBufferInfos = &commands;
++		VkResult result;
++		{
++			const uint64_t lockStart = Diag::enabled() ? Diag::now() : 0;
++			std::lock_guard<std::mutex> queueLock(chain.device->graphicsQueueMutex());
++			if (lockStart) Diag::record("direct.prepare.queueMutexWait", Diag::now() - lockStart);
++			Diag::Span span("direct.prepare.vkQueueSubmit2");
++			result = DynamicVK::vkQueueSubmit2(chain.device->graphicsQueue(), 1, &submit, chain.acquireSlots[slot].fence);
++		}
++		if (result != VK_SUCCESS) {
++			CAMetalDirectLog("acquire transition submit failed: VkResult %d", (int) result);
++			return false;
++		}
++		return true;
++	}
++
++	// Submit worker. Under the queue mutex (the Vulkan queue's external synchronization, shared with Indium's submits):
++	// the GENERAL -> PRESENT_SRC barrier (first scope: everything earlier in submission order on this queue, which
++	// includes every command buffer that wrote the image) signals a binary semaphore at ALL_COMMANDS, and the present
++	// waits on it. The present fence (maintenance1) tells when the semaphore and the swapchain's resources are free.
++	CAMetalDirect::Status present(Chain& chain, uint32_t index) {
++		Diag::Span total("direct.present.total");
++		const uint64_t lockStart = Diag::enabled() ? Diag::now() : 0;
++		std::lock_guard<std::mutex> queueLock(chain.device->graphicsQueueMutex());
++		if (lockStart) Diag::record("direct.present.queueMutexWait", Diag::now() - lockStart);
++
++		auto* slot = &chain.presentSlots[chain.nextPresent % chain.presentSlots.size()];
++		for (uint32_t tries = 0; slot->poisoned && tries < chain.presentSlots.size(); ++tries) {
++			++chain.nextPresent;
++			slot = &chain.presentSlots[chain.nextPresent % chain.presentSlots.size()];
++		}
++		if (slot->poisoned) {
++			return CAMetalDirect::Status::Error;
++		}
++		++chain.nextPresent;
++		if (slot->submitted) {
++			Diag::Span span("direct.present.slotFenceWait");
++			VkResult waited;
++			// Normally already signalled (it belongs to the present presentSlots.size() presents ago).
++			while ((waited = DynamicVK::vkWaitForFences(chain.device->device(), 1, &slot->fence, VK_TRUE, 100000000ull)) == VK_TIMEOUT) {
++				Diag::count("direct.present.slotFenceWait.100ms");
++			}
++			if (waited != VK_SUCCESS) {
++				return CAMetalDirect::Status::Error;
++			}
++			vkResetFences(chain.device->device(), 1, &slot->fence);
++			slot->submitted = false;
++		}
++
++		VkSemaphoreSubmitInfo signal {};
++		signal.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
++		signal.semaphore = slot->ready;
++		signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++		VkCommandBufferSubmitInfo commands {};
++		commands.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
++		commands.commandBuffer = chain.toPresent[index];
++		VkSubmitInfo2 submit {};
++		submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
++		submit.commandBufferInfoCount = 1;
++		submit.pCommandBufferInfos = &commands;
++		submit.signalSemaphoreInfoCount = 1;
++		submit.pSignalSemaphoreInfos = &signal;
++		{
++			Diag::Span span("direct.present.vkQueueSubmit2");
++			if (DynamicVK::vkQueueSubmit2(chain.device->graphicsQueue(), 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) {
++				return CAMetalDirect::Status::Error;
++			}
++		}
++
++		VkSwapchainPresentFenceInfoEXT fenceInfo {};
++		fenceInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT;
++		fenceInfo.swapchainCount = 1;
++		fenceInfo.pFences = &slot->fence;
++		VkPresentInfoKHR info {};
++		info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
++		info.pNext = &fenceInfo;
++		info.waitSemaphoreCount = 1;
++		info.pWaitSemaphores = &slot->ready;
++		info.swapchainCount = 1;
++		info.pSwapchains = &chain.swapchain;
++		info.pImageIndices = &index;
++		VkResult result;
++		{
++			std::lock_guard<std::mutex> lock(chain.hostMutex);
++			Diag::Span span("direct.present.vkQueuePresentKHR");
++			result = DynamicVK::vkQueuePresentKHR(chain.device->graphicsQueue(), &info);
++		}
++		if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
++			slot->submitted = true;
++			if (result == VK_SUBOPTIMAL_KHR) {
++				Diag::count("direct.present.suboptimal");
++				chain.suboptimal = true;
++			}
++			return CAMetalDirect::Status::Ok;
++		}
++		// The semaphore may still be signalled and the fence may never signal: never reuse this slot.
++		slot->poisoned = true;
++		CAMetalDirectLog("present failed: VkResult %d", (int) result);
++		return result == VK_ERROR_OUT_OF_DATE_KHR ? CAMetalDirect::Status::OutOfDate : CAMetalDirect::Status::Error;
++	}
++
++	bool presentsComplete(Chain& chain) {
++		std::lock_guard<std::mutex> queueLock(chain.device->graphicsQueueMutex());
++		for (auto& slot: chain.presentSlots) {
++			if (slot.submitted && !slot.poisoned && vkGetFenceStatus(chain.device->device(), slot.fence) != VK_SUCCESS) {
++				return false;
++			}
++		}
++		return true;
++	}
++
++	bool imagesIdle(Chain& chain, const std::vector<uint32_t>& images) {
++		std::lock_guard<std::mutex> lock(chain.acquireMutex);
++		for (auto& slot: chain.acquireSlots) {
++			if (slot.busy && vkGetFenceStatus(chain.device->device(), slot.fence) != VK_SUCCESS) {
++				// an acquire transition still executing (it may still wait for its acquire semaphore)
++				return false;
++			}
++		}
++		for (uint32_t index: images) {
++			if (!chain.textures[index]->gpuIdle()) return false;
++		}
++		return true;
++	}
++
++	void retire(Chain& chain, const std::vector<uint32_t>& spare);
++
++	void waitForProgress(std::unique_lock<std::mutex>& lock, std::condition_variable& condition, std::chrono::steady_clock::time_point until) {
++		condition.wait_until(lock, until);
++	}
++};
++
++void destroyChainObjects(CAMetalDirectChain& chain) {
++	VkDevice device = chain.device->device();
++	for (auto& slot: chain.acquireSlots) {
++		if (slot.semaphore) DynamicVK::vkDestroySemaphore(device, slot.semaphore, nullptr);
++		if (slot.fence) DynamicVK::vkDestroyFence(device, slot.fence, nullptr);
++	}
++	for (auto& slot: chain.presentSlots) {
++		if (slot.ready) DynamicVK::vkDestroySemaphore(device, slot.ready, nullptr);
++		if (slot.fence) DynamicVK::vkDestroyFence(device, slot.fence, nullptr);
++	}
++	chain.acquireSlots.clear();
++	chain.presentSlots.clear();
++	if (chain.pool) DynamicVK::vkDestroyCommandPool(device, chain.pool, nullptr);
++	chain.pool = VK_NULL_HANDLE;
++	for (auto view: chain.views) {
++		if (view) DynamicVK::vkDestroyImageView(device, view, nullptr);
++	}
++	chain.views.clear();
++	if (chain.swapchain) DynamicVK::vkDestroySwapchainKHR(device, chain.swapchain, nullptr);
++	chain.swapchain = VK_NULL_HANDLE;
++	if (chain.surface) DynamicVK::vkDestroySurfaceKHR(Indium::globalInstance, chain.surface, nullptr);
++	chain.surface = VK_NULL_HANDLE;
++}
++
++void VulkanPlatform::retire(Chain& chain, const std::vector<uint32_t>& spare) {
++	std::lock_guard<std::mutex> lock(chain.hostMutex);
++	if (!spare.empty() && chain.swapchain) {
++		VkReleaseSwapchainImagesInfoEXT info {};
++		info.sType = VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_EXT;
++		info.swapchain = chain.swapchain;
++		info.imageIndexCount = (uint32_t) spare.size();
++		info.pImageIndices = spare.data();
++		const VkResult result = vkReleaseSwapchainImagesEXT(chain.device->device(), &info);
++		if (result != VK_SUCCESS) CAMetalDirectLog("release of %zu spare images failed: VkResult %d", spare.size(), (int) result);
++	}
++	// imagesIdle()/presentsComplete() held: no GPU work and no present uses anything destroyed here.
++	destroyChainObjects(chain);
++	CAMetalDirectLog("swapchain retired (%zu spare images given back)", spare.size());
++}
++
++bool recordTransition(VkCommandBuffer commandBuffer, VkImage image, bool toPresent) {
++	VkCommandBufferBeginInfo begin {};
++	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++	begin.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
++	if (DynamicVK::vkBeginCommandBuffer(commandBuffer, &begin) != VK_SUCCESS) return false;
++	VkImageMemoryBarrier barrier {};
++	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	barrier.image = image;
++	barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++	VkPipelineStageFlags srcStage, dstStage;
++	if (toPresent) {
++		// All writes of the frame (any stage, any earlier submission) -> presentation engine (semaphore-ordered)
++		barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
++		barrier.dstAccessMask = 0;
++		barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
++		barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++		srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++		dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
++	} else {
++		// After the acquire semaphore wait (ALL_COMMANDS): contents are undefined, as for a new Metal drawable
++		barrier.srcAccessMask = 0;
++		barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++		barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++		barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++		srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++		dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++	}
++	DynamicVK::vkCmdPipelineBarrier(commandBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
++	return DynamicVK::vkEndCommandBuffer(commandBuffer) == VK_SUCCESS;
++}
++
++// Everything the swapchain must offer for a Metal drawable texture of this layer (Indium creates the legacy drawable
++// image with the same five usages; framebufferOnly=NO lets the app sample, blit and write it).
++VkImageUsageFlags drawableUsage(bool framebufferOnly, VkFormatFeatureFlags features) {
++	VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++	if (!framebufferOnly || (features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
++	return usage;
++}
++
++std::shared_ptr<CAMetalDirectChain> createChain(const CAMetalDirectTarget& target, std::string& reason) {
++	auto fail = [&](const char* why) { reason = why; return nullptr; };
++	if (!target.device || !target.display || !target.window) return fail("no device or native window");
++	if (!Indium::instanceExtensionEnabled("VK_KHR_xlib_surface")) return fail("VK_KHR_xlib_surface not enabled on the instance");
++	if (!(target.device->features() & Indium::PrivateDevice::Feature::SwapchainMaintenance1)) return fail("VK_EXT_swapchain_maintenance1 not enabled on the device");
++	if (!target.device->graphicsQueueFamilyIndex()) return fail("no graphics queue");
++	if (!resolveDirectFunctions()) return fail("a direct presentation function did not resolve");
++
++	auto chain = std::make_shared<CAMetalDirectChain>();
++	chain->device = target.device;
++	VkPhysicalDevice physical = target.device->physicalDevice();
++	VkDevice device = target.device->device();
++
++	VkXlibSurfaceCreateInfoKHR surfaceInfo {};
++	surfaceInfo.sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR;
++	surfaceInfo.dpy = (Display*) target.display;
++	surfaceInfo.window = (Window) target.window;
++	if (vkCreateXlibSurfaceKHR(Indium::globalInstance, &surfaceInfo, nullptr, &chain->surface) != VK_SUCCESS) return fail("vkCreateXlibSurfaceKHR failed");
++
++	VkBool32 supported = VK_FALSE;
++	vkGetPhysicalDeviceSurfaceSupportKHR(physical, *target.device->graphicsQueueFamilyIndex(), chain->surface, &supported);
++	if (!supported) { destroyChainObjects(*chain); return fail("the graphics queue cannot present to this surface"); }
++
++	VkSurfaceCapabilitiesKHR caps {};
++	DynamicVK::vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, chain->surface, &caps);
++	if (caps.currentExtent.width != target.width || caps.currentExtent.height != target.height) {
++		CAMetalDirectLog("surface extent %ux%u != drawable %ux%u", caps.currentExtent.width, caps.currentExtent.height, target.width, target.height);
++		destroyChainObjects(*chain);
++		return fail("the window size differs from the drawable size");
++	}
++	chain->format = Indium::pixelFormatToVkFormat(target.pixelFormat);
++	uint32_t count = 0;
++	DynamicVK::vkGetPhysicalDeviceSurfaceFormatsKHR(physical, chain->surface, &count, nullptr);
++	std::vector<VkSurfaceFormatKHR> formats(count);
++	DynamicVK::vkGetPhysicalDeviceSurfaceFormatsKHR(physical, chain->surface, &count, formats.data());
++	bool formatOk = false;
++	for (const auto& format: formats) formatOk |= format.format == chain->format && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++	if (!formatOk) { destroyChainObjects(*chain); return fail("the drawable pixel format is not a surface format"); }
++	VkFormatProperties formatProperties {};
++	DynamicVK::vkGetPhysicalDeviceFormatProperties(physical, chain->format, &formatProperties);
++	if (!target.framebufferOnly && !(formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
++		destroyChainObjects(*chain);
++		return fail("framebufferOnly=NO needs storage images of this format, which the device lacks");
++	}
++	const VkImageUsageFlags usage = drawableUsage(target.framebufferOnly, formatProperties.optimalTilingFeatures);
++	if ((caps.supportedUsageFlags & usage) != usage) { destroyChainObjects(*chain); return fail("the surface does not support the drawable usages"); }
++	if (!(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)) { destroyChainObjects(*chain); return fail("no opaque composite alpha"); }
++
++	DynamicVK::vkGetPhysicalDeviceSurfacePresentModesKHR(physical, chain->surface, &count, nullptr);
++	std::vector<VkPresentModeKHR> modes(count);
++	DynamicVK::vkGetPhysicalDeviceSurfacePresentModesKHR(physical, chain->surface, &count, modes.data());
++	auto has = [&](VkPresentModeKHR mode) { for (auto m: modes) if (m == mode) return true; return false; };
++	// displaySyncEnabled=NO is the legacy path's swap interval 0
++	chain->presentMode = target.displaySync ? VK_PRESENT_MODE_FIFO_KHR :
++		has(VK_PRESENT_MODE_IMMEDIATE_KHR) ? VK_PRESENT_MODE_IMMEDIATE_KHR : has(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
++
++	// Forward progress for maxDrawables held images: imageCount >= minImageCount + maxDrawables - 1. The per-mode
++	// minimum may be higher than caps.minImageCount (MAILBOX on Mesa X11: 4); the larger count is still valid.
++	uint32_t imageCount = std::max(caps.minImageCount, 2u) + target.maxDrawables - 1;
++	if (chain->presentMode == VK_PRESENT_MODE_MAILBOX_KHR) imageCount += 1;
++	if (caps.maxImageCount != 0 && imageCount > caps.maxImageCount) { destroyChainObjects(*chain); return fail("the surface allows too few images"); }
++	chain->minImageCount = caps.minImageCount;
++
++	VkSwapchainCreateInfoKHR info {};
++	info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
++	info.surface = chain->surface;
++	info.minImageCount = imageCount;
++	info.imageFormat = chain->format;
++	info.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++	info.imageExtent = caps.currentExtent;
++	info.imageArrayLayers = 1;
++	info.imageUsage = usage;
++	info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
++	info.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++	info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++	info.presentMode = chain->presentMode;
++	info.clipped = VK_TRUE;
++	const VkResult created = DynamicVK::vkCreateSwapchainKHR(device, &info, nullptr, &chain->swapchain);
++	if (created != VK_SUCCESS) {
++		CAMetalDirectLog("vkCreateSwapchainKHR: VkResult %d", (int) created);
++		destroyChainObjects(*chain);
++		return fail("vkCreateSwapchainKHR failed");
++	}
++	chain->width = caps.currentExtent.width;
++	chain->height = caps.currentExtent.height;
++	DynamicVK::vkGetSwapchainImagesKHR(device, chain->swapchain, &count, nullptr);
++	chain->images.resize(count);
++	DynamicVK::vkGetSwapchainImagesKHR(device, chain->swapchain, &count, chain->images.data());
++
++	VkCommandPoolCreateInfo poolInfo {};
++	poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++	poolInfo.queueFamilyIndex = *target.device->graphicsQueueFamilyIndex();
++	if (DynamicVK::vkCreateCommandPool(device, &poolInfo, nullptr, &chain->pool) != VK_SUCCESS) { destroyChainObjects(*chain); return fail("command pool"); }
++	chain->toGeneral.resize(count);
++	chain->toPresent.resize(count);
++	VkCommandBufferAllocateInfo allocate {};
++	allocate.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++	allocate.commandPool = chain->pool;
++	allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++	allocate.commandBufferCount = count;
++	if (DynamicVK::vkAllocateCommandBuffers(device, &allocate, chain->toGeneral.data()) != VK_SUCCESS ||
++	    DynamicVK::vkAllocateCommandBuffers(device, &allocate, chain->toPresent.data()) != VK_SUCCESS) {
++		destroyChainObjects(*chain);
++		return fail("command buffers");
++	}
++	chain->views.resize(count, VK_NULL_HANDLE);
++	for (uint32_t i = 0; i < count; ++i) {
++		VkImageViewCreateInfo view {};
++		view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++		view.image = chain->images[i];
++		view.viewType = VK_IMAGE_VIEW_TYPE_2D;
++		view.format = chain->format;
++		view.components = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A };
++		view.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++		if (DynamicVK::vkCreateImageView(device, &view, nullptr, &chain->views[i]) != VK_SUCCESS ||
++		    !recordTransition(chain->toGeneral[i], chain->images[i], false) || !recordTransition(chain->toPresent[i], chain->images[i], true)) {
++			destroyChainObjects(*chain);
++			return fail("image views or transitions");
++		}
++		chain->textures.push_back(std::make_shared<CAMetalDirectTexture>(target.device, chain->images[i], chain->views[i], chain->width, chain->height, target.pixelFormat, target.framebufferOnly));
++	}
++	chain->imageSlot.assign(count, 0);
++	VkSemaphoreCreateInfo semaphoreInfo {};
++	semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++	VkFenceCreateInfo fenceInfo {};
++	fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++	chain->acquireSlots.resize(target.maxDrawables + count);
++	for (auto& slot: chain->acquireSlots) {
++		if (DynamicVK::vkCreateSemaphore(device, &semaphoreInfo, nullptr, &slot.semaphore) != VK_SUCCESS ||
++		    DynamicVK::vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS) {
++			destroyChainObjects(*chain);
++			return fail("acquire semaphores");
++		}
++	}
++	chain->presentSlots.resize(count * 2);
++	for (auto& slot: chain->presentSlots) {
++		if (DynamicVK::vkCreateSemaphore(device, &semaphoreInfo, nullptr, &slot.ready) != VK_SUCCESS ||
++		    DynamicVK::vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS) {
++			destroyChainObjects(*chain);
++			return fail("present semaphores");
++		}
++	}
++	static const char* modeNames[] = { "IMMEDIATE", "MAILBOX", "FIFO", "FIFO_RELAXED" };
++	CAMetalDirectLog("swapchain created: window 0x%lx %ux%u format %d usage 0x%x mode %s images %u (min %u, max held %u)",
++		target.window, chain->width, chain->height, (int) chain->format, (unsigned) usage,
++		chain->presentMode <= 3 ? modeNames[chain->presentMode] : "?", count, caps.minImageCount, target.maxDrawables);
++	return chain;
++}
++
++} // namespace
++
++//
++// per-layer state
++//
++
++class CAMetalDirectLayerState {
++public:
++	VulkanPlatform platform;
++	CAMetalDirect::Presenter<VulkanPlatform> presenter { platform };
++	dispatch_queue_t handlerQueue = nullptr;
++	id<MTLCommandQueue> directPresentQueue = nil; // for -[CAMetalDrawable present]
++	std::mutex queueMutex;
++
++	CAMetalDirectLayerState() {
++		handlerQueue = dispatch_queue_create("org.darlinghq.QuartzCore.direct-present-handlers", DISPATCH_QUEUE_SERIAL);
++	}
++	~CAMetalDirectLayerState() {
++		if (handlerQueue) dispatch_release(handlerQueue);
++		[directPresentQueue release];
++	}
++};
++
++namespace {
++std::mutex registryMutex;
++std::vector<std::weak_ptr<CAMetalDirectLayerState>>* registry = new std::vector<std::weak_ptr<CAMetalDirectLayerState>>;
++
++// Process exit unloads native libraries while other threads run (see the presentation-endpoint note in Darling's
++// history): Mesa's WSI keeps two threads per swapchain, so every swapchain is retired before that, bounded.
++void retireAllAtExit() {
++	std::vector<std::shared_ptr<CAMetalDirectLayerState>> states;
++	{
++		std::lock_guard<std::mutex> lock(registryMutex);
++		for (auto& weak: *registry) if (auto state = weak.lock()) states.push_back(state);
++	}
++	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
++	for (auto& state: states) {
++		state->presenter.revoke();
++		while (!state->presenter.tryRetire()) {
++			if (std::chrono::steady_clock::now() >= deadline) {
++				CAMetalDirectLog("exit: swapchain still in use after 1000 ms (held %u); exiting without destroying it", state->presenter.held());
++				break;
++			}
++			std::this_thread::sleep_for(std::chrono::milliseconds(1));
++		}
++	}
++}
++}
++
++std::shared_ptr<CAMetalDirectLayerState> CAMetalDirectCreateState() {
++	auto state = std::make_shared<CAMetalDirectLayerState>();
++	static std::once_flag once;
++	std::call_once(once, [] { atexit(retireAllAtExit); });
++	std::lock_guard<std::mutex> lock(registryMutex);
++	registry->push_back(state);
++	return state;
++}
++
++bool CAMetalDirectBeginActivation(const std::shared_ptr<CAMetalDirectLayerState>& state, const CAMetalDirectTarget& target, std::string& reason) {
++	if (state->presenter.state() != CAMetalDirect::State::Inactive) {
++		reason = "not inactive";
++		return false;
++	}
++	auto chain = createChain(target, reason);
++	if (!chain) return false;
++	if (!state->presenter.beginActivation(chain, target.maxDrawables)) {
++		state->platform.retire(*chain, {});
++		reason = "presenter refused activation";
++		return false;
++	}
++	return true;
++}
++
++bool CAMetalDirectCompleteActivation(const std::shared_ptr<CAMetalDirectLayerState>& state) {
++	return state->presenter.completeActivation();
++}
++
++CAMetalDirect::State CAMetalDirectRevoke(const std::shared_ptr<CAMetalDirectLayerState>& state) {
++	return state->presenter.revoke();
++}
++
++bool CAMetalDirectTryRetire(const std::shared_ptr<CAMetalDirectLayerState>& state) {
++	return state->presenter.tryRetire();
++}
++
++bool CAMetalDirectSuboptimal(const std::shared_ptr<CAMetalDirectLayerState>& state) {
++	auto chain = state->presenter.currentChain();
++	return chain && chain->suboptimal.load();
++}
++
++CAMetalDirect::State CAMetalDirectStateOf(const std::shared_ptr<CAMetalDirectLayerState>& state) {
++	return state->presenter.state();
++}
++
++void CAMetalDirectLogCounters(const std::shared_ptr<CAMetalDirectLayerState>& state, const char* when) {
++	const auto c = state->presenter.counters();
++	CAMetalDirectLog("%s: state %s acquired %llu (spare reuse %llu) presented %llu presentFailures %llu abandoned %llu acquireTimeouts %llu acquireFailures %llu notActive %llu polls %llu activations %llu revocations %llu retirements %llu",
++		when, CAMetalDirect::describe(state->presenter.state()), (unsigned long long) c.acquired, (unsigned long long) c.reusedSpare,
++		(unsigned long long) c.presented, (unsigned long long) c.presentFailures, (unsigned long long) c.abandoned,
++		(unsigned long long) c.acquireTimeouts, (unsigned long long) c.acquireFailures, (unsigned long long) c.notActive,
++		(unsigned long long) c.acquirePolls, (unsigned long long) c.activations, (unsigned long long) c.revocations, (unsigned long long) c.retirements);
++}
++
++//
++// the drawable
++//
++
++@interface CAMetalDirectDrawableInternal : NSObject <CAMetalDrawable, MTLDrawableInternal> {
++	std::shared_ptr<CAMetalDirectLayerState> _state;
++	CAMetalDirect::Presenter<VulkanPlatform>::Image _image;
++	MTLTextureInternal* _texture;
++	CAMetalLayer* _layer;
++	NSMutableArray<MTLDrawablePresentedHandler>* _presentedHandlers;
++	std::atomic<int> _phase; // 0 acquired, 1 handed to a command buffer, 2 resolved (presented, dropped or abandoned)
++	CFTimeInterval _presentedTime;
++}
++- (instancetype)initWithState: (std::shared_ptr<CAMetalDirectLayerState>)state layer: (CAMetalLayer*)layer image: (const CAMetalDirect::Presenter<VulkanPlatform>::Image&)image;
++- (void)_directResolved: (BOOL)presented;
++@end
++
++namespace {
++// What a command buffer holds for -presentDrawable: of a direct drawable. present() runs on Indium's submit worker after
++// the presenting command buffer's vkQueueSubmit2 (and after the queue mutex was released); it never runs client code.
++class CAMetalDirectHandoff final: public Indium::Drawable {
++	std::shared_ptr<CAMetalDirectLayerState> _state;
++	CAMetalDirect::Presenter<VulkanPlatform>::Image _image;
++	CAMetalDirectDrawableInternal* _owner; // retained
++	bool _presented = false;
++
++public:
++	CAMetalDirectHandoff(std::shared_ptr<CAMetalDirectLayerState> state, const CAMetalDirect::Presenter<VulkanPlatform>::Image& image, CAMetalDirectDrawableInternal* owner):
++		_state(std::move(state)), _image(image), _owner([owner retain]) {}
++
++	~CAMetalDirectHandoff() override {
++		if (!_presented) {
++			// The command buffer died without presenting: the image goes back as a spare (GPU uses are tracked).
++			_state->presenter.abandon(_image);
++			Diag::count("direct.handoffAbandoned");
++			[_owner _directResolved: NO];
++		}
++		@autoreleasepool {
++			[_owner release];
++		}
++	}
++
++	void present() override {
++		if (_presented) return;
++		_presented = true;
++		void* sample = CAMetalPresentIntervalBegin();
++		const auto status = _state->presenter.present(_image);
++		CAMetalPresentIntervalDone(sample);
++		Diag::count(status == CAMetalDirect::Status::Ok ? "direct.presented" : "direct.presentFailed");
++		[_owner _directResolved: status == CAMetalDirect::Status::Ok];
++	}
++};
++}
++
++@implementation CAMetalDirectDrawableInternal
++
++- (instancetype)initWithState: (std::shared_ptr<CAMetalDirectLayerState>)state layer: (CAMetalLayer*)layer image: (const CAMetalDirect::Presenter<VulkanPlatform>::Image&)image
++{
++	self = [super init];
++	if (self) {
++		_state = std::move(state);
++		_image = image;
++		_layer = [layer retain];
++		_presentedHandlers = [NSMutableArray new];
++		_phase.store(0);
++		_texture = [[MTLTextureInternal alloc] initWithTexture: image.chain->textures[image.index] device: layer.device resourceOptions: MTLResourceStorageModeShared];
++	}
++	return self;
++}
++
++- (void)dealloc
++{
++	int expected = 0;
++	if (_phase.compare_exchange_strong(expected, 2)) {
++		// acquired, never handed to a command buffer
++		_state->presenter.abandon(_image);
++		Diag::count("direct.abandoned");
++	}
++	[_texture release];
++	[_layer release];
++	[_presentedHandlers release];
++	[super dealloc];
++}
++
++- (id<MTLTexture>)texture { return _texture; }
++- (CAMetalLayer*)layer { return _layer; }
++- (NSUInteger)drawableID { return _image.index; }
++- (CFTimeInterval)presentedTime { return _presentedTime; }
++
++- (void)addPresentedHandler: (MTLDrawablePresentedHandler)block
++{
++	@synchronized(self) {
++		[_presentedHandlers addObject: [[block copy] autorelease]];
++	}
++}
++
++// Submit worker: handlers run on the layer's serial handler queue, never on the worker. presentedTime stays 0: a
++// submitted present is not an observed presentation.
++- (void)_directResolved: (BOOL)presented
++{
++	_phase.store(2);
++	[self retain];
++	dispatch_async(_state->handlerQueue, ^{
++		@autoreleasepool {
++			NSArray* handlers;
++			@synchronized(self) {
++				handlers = [[_presentedHandlers copy] autorelease];
++			}
++			for (MTLDrawablePresentedHandler handler in handlers) {
++				handler(self);
++			}
++			[self release];
++		}
++	});
++}
++
++// MTLDrawableInternal (-[MTLCommandBuffer presentDrawable:], app thread)
++- (std::shared_ptr<Indium::Drawable>)drawable
++{
++	int expected = 0;
++	if (!_phase.compare_exchange_strong(expected, 1)) {
++		// presented twice: the second request presents nothing
++		struct Nothing final: public Indium::Drawable { void present() override {} };
++		return std::make_shared<Nothing>();
++	}
++	return std::make_shared<CAMetalDirectHandoff>(_state, _image, self);
++}
++
++- (void)present
++{
++	// Ordered after everything already committed: an empty command buffer that presents this drawable.
++	id<MTLCommandQueue> queue;
++	{
++		std::lock_guard<std::mutex> lock(_state->queueMutex);
++		if (!_state->directPresentQueue) _state->directPresentQueue = [_layer.device newCommandQueue];
++		queue = _state->directPresentQueue;
++	}
++	id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
++	[commandBuffer presentDrawable: self];
++	[commandBuffer commit];
++}
++
++- (void)presentAtTime: (CFTimeInterval)presentationTime
++{
++	[self present];
++}
++
++- (void)presentAfterMinimumDuration: (CFTimeInterval)duration
++{
++	[self present];
++}
++
++@end
++
++id<CAMetalDrawable> CAMetalDirectNextDrawable(const std::shared_ptr<CAMetalDirectLayerState>& state, CAMetalLayer* layer,
++	std::chrono::steady_clock::time_point deadline, CAMetalDirect::AcquireResult& result)
++{
++	Diag::Span span("direct.nextDrawable");
++	CAMetalDirect::Presenter<VulkanPlatform>::Image image;
++	result = state->presenter.acquire(image, deadline);
++	if (result != CAMetalDirect::AcquireResult::Acquired) {
++		Diag::count(result == CAMetalDirect::AcquireResult::TimedOut ? "direct.nextDrawable.timeout" :
++			result == CAMetalDirect::AcquireResult::Failed ? "direct.nextDrawable.failed" : "direct.nextDrawable.notActive");
++		return nil;
++	}
++	return [[[CAMetalDirectDrawableInternal alloc] initWithState: state layer: layer image: image] autorelease];
++}
++
++#endif
+diff --git a/QuartzCore/CAMetalDirectSupport.h b/QuartzCore/CAMetalDirectSupport.h
+new file mode 100644
+index 00000000..2a75f30f
+--- /dev/null
++++ b/QuartzCore/CAMetalDirectSupport.h
+@@ -0,0 +1,73 @@
++/*
++ * This file is part of Darling.
++ *
++ * Copyright (C) 2026 Darling developers
++ *
++ * Darling is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Darling is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Darling.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// darling-lol (prototype): what CAMetalLayer uses of direct presentation (CAMetalDirectPresent.mm).
++
++#pragma once
++
++#import <QuartzCore/CAMetalLayer.h>
++
++#if DARLING_METAL_ENABLED
++
++#include <indium/indium.private.hpp>
++#include <chrono>
++#include <memory>
++#include <string>
++#include "CAMetalDirectPresent.h"
++
++class CAMetalDirectLayerState;
++
++// Indium::directPresentationRequested(): guest flag /tmp/metal-direct-present (or a default-on libindium).
++bool CAMetalDirectEnabled();
++// The present-request sampler of -[CAMetalLayer queuePresent:] (opt-in capture), for the direct path's requests.
++void* CAMetalPresentIntervalBegin();
++void CAMetalPresentIntervalDone(void* sample);
++
++// The native window a layer's context draws into, and what the layer needs from a swapchain on it.
++struct CAMetalDirectTarget {
++	void* display = nullptr;      // native Xlib Display*
++	unsigned long window = 0;     // XID of the window the legacy compositor's surface draws into
++	uint32_t width = 0, height = 0;
++	Indium::PixelFormat pixelFormat = Indium::PixelFormat::Invalid;
++	bool framebufferOnly = true;
++	bool displaySync = true;
++	uint32_t maxDrawables = 3;
++	std::shared_ptr<Indium::PrivateDevice> device;
++};
++
++std::shared_ptr<CAMetalDirectLayerState> CAMetalDirectCreateState();
++// Main thread. Creates the swapchain and enters Activating; false (with the reason) leaves the layer on the legacy path.
++bool CAMetalDirectBeginActivation(const std::shared_ptr<CAMetalDirectLayerState>& state, const CAMetalDirectTarget& target, std::string& reason);
++bool CAMetalDirectCompleteActivation(const std::shared_ptr<CAMetalDirectLayerState>& state);
++CAMetalDirect::State CAMetalDirectRevoke(const std::shared_ptr<CAMetalDirectLayerState>& state);
++bool CAMetalDirectTryRetire(const std::shared_ptr<CAMetalDirectLayerState>& state);
++// The current swapchain reported VK_SUBOPTIMAL_KHR (it still works; a new swapchain may present without a server copy).
++bool CAMetalDirectSuboptimal(const std::shared_ptr<CAMetalDirectLayerState>& state);
++CAMetalDirect::State CAMetalDirectStateOf(const std::shared_ptr<CAMetalDirectLayerState>& state);
++// One log line with the counters (transitions only).
++void CAMetalDirectLogCounters(const std::shared_ptr<CAMetalDirectLayerState>& state, const char* when);
++// Transition log (/tmp/metal-direct-present.log), never per frame.
++void CAMetalDirectLog(const char* format, ...) __attribute__((format(printf, 1, 2)));
++
++// nextDrawable: a drawable whose texture is an acquired swapchain image (result Acquired), or nil with the result
++// telling the caller to take the legacy path (NotActive/Failed) or to return nil (TimedOut).
++id<CAMetalDrawable> CAMetalDirectNextDrawable(const std::shared_ptr<CAMetalDirectLayerState>& state, CAMetalLayer* layer,
++	std::chrono::steady_clock::time_point deadline, CAMetalDirect::AcquireResult& result);
++
++#endif
+diff --git a/QuartzCore/CAMetalLayerInternal.h b/QuartzCore/CAMetalLayerInternal.h
+index 48693da0..09d78089 100644
+--- a/QuartzCore/CAMetalLayerInternal.h
++++ b/QuartzCore/CAMetalLayerInternal.h
+@@ -23,8 +23,10 @@
+ 
+ #include <memory>
+ #include <array>
++#include <atomic>
+ 
+ class CAMetalDrawableActual;
++class CAMetalDirectLayerState;
+ 
+ @interface CAMetalLayerInternal : CAMetalLayer {
+ 	id<MTLDevice> _device;
+@@ -48,6 +50,16 @@ class CAMetalDrawableActual;
+ 	std::shared_ptr<CAMetalDrawableActual> _lastPresentedDrawable;
+ 
+ 	GLuint _tex;
++
++	// darling-lol (direct presentation prototype, guest flag /tmp/metal-direct-present)
++	std::shared_ptr<CAMetalDirectLayerState> _direct;
++	std::atomic<bool> _directDriveScheduled;
++	CFTimeInterval _directActivationStart;
++	CFTimeInterval _directDrainStart;
++	CFTimeInterval _directLastEvaluation;
++	BOOL _directDrainLogged;
++	unsigned _directSuboptimalRecreations;
++	CFTimeInterval _directActivationLogged;
+ }
+ 
+ - (void)queuePresent: (NSUInteger)drawableID;

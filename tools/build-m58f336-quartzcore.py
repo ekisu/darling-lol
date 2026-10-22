@@ -13,7 +13,8 @@ for line in (framework / 'CMakeFiles/QuartzCore.dir/flags.make').read_text().spl
         flags[key] = shlex.split(value)
 link = shlex.split((framework / 'CMakeFiles/QuartzCore.dir/link.txt').read_text())
 sources = ['CALayer.m', 'CALayerContext.m', 'CARenderer.m', 'CATransaction.m',
-           'CATransactionGroup.m', 'CATransformLayer.m', 'CAMetalLayer.mm', 'CAMetalDrawable.mm']
+           'CATransactionGroup.m', 'CATransformLayer.m', 'CAMetalLayer.mm', 'CAMetalDrawable.mm',
+           'CAMetalDirectPresent.mm']
 for source in sources:
     kind = 'CXX' if source.endswith('.mm') else 'C'
     obj = project / f'build/m336-{Path(source).stem}.o'
@@ -22,7 +23,12 @@ for source in sources:
                     '-Wno-macro-redefined', '-c',
                     str(project / 'build/darling-src/src/external/cocotron/QuartzCore' / source),
                     '-o', str(obj)], check=True)
-    link[link.index(f'CMakeFiles/QuartzCore.dir/{source}.o')] = str(obj)
+    target = f'CMakeFiles/QuartzCore.dir/{source}.o'
+    # A build tree configured before the source was added does not list it yet.
+    if target in link:
+        link[link.index(target)] = str(obj)
+    else:
+        link.insert(link.index('-o'), str(obj))
 link[link.index('-o') + 1] = str(project / 'build/m336-QuartzCore')
 subprocess.run(link, cwd=framework, check=True)
 print('Built isolated QuartzCore compositor and Metal presentation')
