@@ -36,5 +36,6 @@ jobs:
       - run: python -m unittest discover -s tests -p 'test_indium_address_shadow.py' -v
       - run: python -m unittest discover -s tests -p 'test_metal_direct_present.py' -v
       - run: python -m unittest discover -s tests -p 'test_metal_present_pacing.py' -v
+      - run: python -m unittest discover -s tests -p 'test_metal_startup_config.py' -v
       - run: python -m unittest discover -s tests -p 'test_exec_guest.py'
       - run: python -m unittest discover -s tests -p 'test_close_league_client_in_game.py'

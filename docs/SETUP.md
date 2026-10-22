@@ -165,10 +165,45 @@ The hand-off experiments (`metal-present-dispatch-wait`, `metal-deferred-blit` a
 | `/tmp/metal-gpu` | diagnostic: selects the Vulkan device used for Metal by index or case-insensitive name substring instead of the loader's first device. The OpenGL context that presents does not follow it; see [hybrid laptops](TROUBLESHOOTING.md#hybrid-graphics-laptops-amdintel-igpu--nvidia). `METAL_INDIUM_GPU` is the environment equivalent; the file wins |
 | `/tmp/metal-all-devices` | a `VkDevice` is created for every supported Vulkan device, as before 2026-10-16. Without it only the selected device gets one; on a machine with lavapipe installed this also drops lavapipe's idle rasterizer threads |
 | `/tmp/metal-no-drawable-vram` | drawables of a layer with `framebufferOnly` off (League sets it off) go back to host-visible system RAM, as before 2026-10-16. Without the file they are allocated in GPU memory like `framebufferOnly` drawables; nothing maps drawable memory from the CPU. On the RX 6600 this gave about 20 FPS more in a practice-tool fight and the same FPS when idle, not yet measured in an ARAM. `/tmp/metal-device.log` shows `drawable-vram=on` and `storage=vram` |
-| `/tmp/metal-no-lazy-wakeup` | every completion registration signals the event loop's wake-up semaphore from the CPU again, as before 2026-10-18. The handshake is per device. Without the file a registration signals only while the poller has announced a blocking wait (a spinning poller re-reads the registrations on its next pass, and its spin ends when one arrives). On the NVIDIA proprietary driver each `vkSignalSemaphore` is an RM control ioctl that waits on a driver-wide lock, about 0.3 ms each and ~25 per League frame, and it was the largest kernel cost of the submit worker. Re-read every 256 registrations; the wait log counts `wakeupSignalled` and `wakeupSkipped` |
-| `/tmp/metal-submit-batch-us` | the submit batch window in microseconds (500–100000, default 500); re-read every 256 checks, so it can be changed during a match. A presenting commit and every CPU wait still flush the batch at once. On the NVIDIA proprietary driver every `vkQueueSubmit2` is an RM control ioctl that waits on a driver-wide lock (about 0.4 ms each in a League match); with the default window a frame took about 8.5 submits, with `5000` about 2.5 (RTX 4090: 89 → 113 FPS, same match) |
-| `/tmp/metal-submit-batch-max` | command buffers per batch (1–256, default 16), re-read like the window; `64` lets one batch hold a whole frame |
+| `/tmp/metal-no-lazy-wakeup` | every completion registration signals the event loop's wake-up semaphore from the CPU again, as before 2026-10-18. The handshake is per device. Without the file a registration signals only while the poller has announced a blocking wait (a spinning poller re-reads the registrations on its next pass, and its spin ends when one arrives). On the NVIDIA proprietary driver each `vkSignalSemaphore` is an RM control ioctl that waits on a driver-wide lock, about 0.3 ms each and ~25 per League frame, and it was the largest kernel cost of the submit worker. Read once per game process; the wait log counts `wakeupSignalled` and `wakeupSkipped` |
+| `/tmp/metal-submit-batch-us` | the submit batch window in microseconds (500–100000, default 500); read once per game process, so set it before the game starts. A presenting commit and every CPU wait still flush the batch at once. On the NVIDIA proprietary driver every `vkQueueSubmit2` is an RM control ioctl that waits on a driver-wide lock (about 0.4 ms each in a League match); with the default window a frame took about 8.5 submits, with `5000` about 2.5 (RTX 4090: 89 → 113 FPS, same match) |
+| `/tmp/metal-submit-batch-max` | command buffers per batch (1–256, default 16), read once like the window; `64` lets one batch hold a whole frame |
 | `/tmp/metal-debug-waits` | diagnostic: counts how often and how long threads block at the hand-off waits and in `nextDrawable`, every 5 s in `/tmp/metal-trace.log`; the first check writes a `waits enabled` line |
+
+#### Startup configuration (environment)
+
+Switches that the game used to re-read from guest files while it ran are now read once per game process, at their first use. Some of these lookups ran on every frame or every few dozen command buffers. Each one also has an environment variable. A guest `access()` or `fopen()` of a missing file costs about 28 µs under Darling, 9 µs when the file exists (RX 6600 host, 2026-10-22). The checks removed here added up to roughly 60–75 µs per frame at 300 frames per second, the presenting commit's on the game thread. That is an estimate from call counts, not a measured frame-rate change.
+
+The value is resolved in this order:
+
+- the variable, when it is set and not empty: `0` means off, anything else on; numbers are decimal and clamped to the range shown, and text that is not a whole number keeps the default;
+- otherwise the former guest file, checked once, with its former meaning (present = on, or the number in it), so creating the file before the game starts still works;
+- otherwise the default, unchanged.
+
+A change, by file or by variable, takes effect in the next game process: restart the game, not the whole runtime. Set the variables in the environment that starts the client (for example before `scripts/run.sh` or `darling-lol`); the launcher passes the environment through to the game.
+
+| Variable | Former guest file | Default | Effect |
+|---|---|---|---|
+| `DARLING_METAL_ASYNC_NO_FRAME_SYNC` | `/tmp/metal-async-no-frame-sync` | off | no frame-end wait at all (A/B only) |
+| `DARLING_METAL_NO_BINDING_REUSE` | `/tmp/metal-no-binding-reuse` | off | turns binding reuse off |
+| `DARLING_METAL_RETIRE_TINY` | `/tmp/metal-retire-tiny` | off | small command buffers also retire on the worker |
+| `DARLING_METAL_NO_SUBMIT_BATCH` | `/tmp/metal-no-submit-batch` | off | turns submit batching off |
+| `DARLING_METAL_SUBMIT_BATCH_US` | `/tmp/metal-submit-batch-us` | 500 | batch window, 500–100000 µs |
+| `DARLING_METAL_SUBMIT_BATCH_MAX` | `/tmp/metal-submit-batch-max` | 16 | command buffers per batch, 1–256 |
+| `DARLING_METAL_NO_LAZY_WAKEUP` | `/tmp/metal-no-lazy-wakeup` | off | every completion registration signals the wake-up semaphore |
+| `DARLING_METAL_ASYNC_UPLOADS` | `/tmp/metal-async-uploads` | off | texture uploads without the synchronous wait |
+| `DARLING_METAL_NO_LAZY_PASS` | `/tmp/metal-no-lazy-pass` | off | render passes begin at creation, not at the first draw |
+| `DARLING_METAL_ASYNC_ENCODE` / `DARLING_METAL_NO_ASYNC_ENCODE` | `/tmp/metal-async-encode` / `/tmp/metal-no-async-encode` | on in the game process only | deferred render encoding on in any process / off in the game |
+| `DARLING_METAL_OUTLINE_PAIRS` / `DARLING_METAL_OUTLINE_PAIRS2` | `/tmp/metal-outline-pairs` / `/tmp/metal-outline-pairs2` | 0 / 16 | outline chain passes kept, 0–16; other values keep the default |
+| `DARLING_METAL_SKIP_<1180, 512, 1024, 1080, 242, UI, SCENE>` | `/tmp/metal-skip-<1180, 512, 1024, 1080, 242, ui, scene>` | off | diagnostic: skip the draws of render passes of that size |
+| `DARLING_METAL_SNAPSHOT` | (none) | off | diagnostic: watch for the `/tmp/metal-snapshot` trigger file, a few times a second, while the game runs |
+
+Not converted, on purpose:
+
+- switches that were already read once per process (the rest of the table above, the direct-presentation and paced-commit switches);
+- diagnostic triggers that are only polled while a startup diagnostic is on: `/tmp/metal-seqlog` under GPU timing, the draw-limit and state-flag experiments under `/tmp/metal-debug-draws`;
+- the frame-interval capture trigger `/tmp/metal-frame-interval-capture`, checked once per 128 presented frames until it fires. Benchmarks arm it during a running game;
+- output files such as the logs, captures and `/tmp/indium-submit-stats.log`, written once per 1024 presented frames.
 
 #### Direct Vulkan presentation (experimental, off by default)
 
