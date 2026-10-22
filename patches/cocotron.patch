@@ -12528,10 +12528,10 @@ index 00000000..dbfdf1b3
 +} // namespace CAMetalDirect
 diff --git a/QuartzCore/CAMetalDirectPresent.mm b/QuartzCore/CAMetalDirectPresent.mm
 new file mode 100644
-index 00000000..dd3360bb
+index 00000000..e6e76366
 --- /dev/null
 +++ b/QuartzCore/CAMetalDirectPresent.mm
-@@ -0,0 +1,876 @@
+@@ -0,0 +1,882 @@
 +/*
 + * This file is part of Darling.
 + *
@@ -13290,6 +13290,9 @@ index 00000000..dd3360bb
 +		Diag::count(status == CAMetalDirect::Status::Ok ? "direct.presented" : "direct.presentFailed");
 +		[_owner _directResolved: status == CAMetalDirect::Status::Ok];
 +	}
++
++	// vkQueuePresentKHR on the submit worker; the presented handlers are dispatched to the layer's handler queue
++	bool presentsIndependently() const override { return true; }
 +};
 +}
 +
@@ -13361,7 +13364,10 @@ index 00000000..dd3360bb
 +	int expected = 0;
 +	if (!_phase.compare_exchange_strong(expected, 1)) {
 +		// presented twice: the second request presents nothing
-+		struct Nothing final: public Indium::Drawable { void present() override {} };
++		struct Nothing final: public Indium::Drawable {
++			void present() override {}
++			bool presentsIndependently() const override { return true; }
++		};
 +		return std::make_shared<Nothing>();
 +	}
 +	return std::make_shared<CAMetalDirectHandoff>(_state, _image, self);
