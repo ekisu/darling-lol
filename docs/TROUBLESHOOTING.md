@@ -1,5 +1,33 @@
 # Troubleshooting
 
+## Before reporting a problem
+
+Run the host checks first; they start nothing and work while a client is open:
+
+```sh
+darling-lol --doctor
+```
+
+It reports the GPU/driver, Vulkan, display session, memory, disk, overlay layer
+and prefix state, and ends with the checks that need attention. If you open an
+issue, attach the machine-readable report and a crash bundle instead of a
+hand-copied log:
+
+```sh
+darling-lol --doctor --report doctor.json
+darling-lol --report                # ~/.cache/darling-lol/reports/*.tar.gz
+darling-lol --perf                  # frame pacing from the game's own logs
+```
+
+The crash bundle contains the doctor checks, the runtime/client/zombie process
+table, the runtime and launcher log tails, graphics kernel messages, display
+state and recent core dumps. It does not collect environment variables, masks
+credential-shaped command-line values, and replaces your home directory, user
+name and host name unless you pass `--no-redact`. Log text itself is copied
+verbatim, so skim the bundle before sharing it. See
+[compatibility](COMPATIBILITY.md) for what the performance numbers mean and
+for verified machines.
+
 ## NixOS launcher fails before Riot opens
 
 A message saying Darling must be setuid root is not fixed by running `sudo`
@@ -19,6 +47,29 @@ never delete a populated Riot/game prefix just to repair the launcher.
 
 
 Use the [setup instructions](SETUP.md) from the repository root as your ordinary user. Exit the game and both clients manually before a full installation or Darling restart. Incremental server/memory installers can replace files without interrupting processes, but their changes need a later full restart to activate.
+
+## Setup stops at preflight
+
+`scripts/build.sh` and `scripts/install-runtime.sh` now run `scripts/preflight.py` before the source fetch, the build and the per-user install. Host versions that cannot build or run the result fail in seconds with one actionable line instead of after the long steps ([#137](https://github.com/lucannez64/darling-lol/issues/137), [#138](https://github.com/lucannez64/darling-lol/issues/138), [#143](https://github.com/lucannez64/darling-lol/issues/143)):
+
+- **python** 3.10 or newer. The per-user installers hash files with a streaming helper instead of `hashlib.file_digest`, which only exists from Python 3.11, so the Ubuntu 22.04 default no longer fails at the end of the install.
+- **cmake** 3.20 or newer. The bundled indium CMakeLists requires it.
+- **git-lfs** 2.13 or newer. The pinned submodules ship libraries as LFS objects.
+- **lfs-pointer**: when `build/darling-src` is already prepared, small `.dylib`, `.a`, `.so` and `.o` files are checked for Git LFS pointer text. A pointer file links but crashes the guest, so this is a required check rather than a warning. It passes before the first fetch, when there is nothing to inspect yet.
+- **kernel** 5.14 or newer for `MADV_POPULATE_WRITE`.
+- **llvm** 16 or newer; 22 or 23 is what the patches are tested with. Iridium calls `LLVMGetVersion`, which LLVM 15 does not export, so an LLVM 15 runtime aborts as soon as Riot creates a Metal device ([#139](https://github.com/lucannez64/darling-lol/issues/139)). LLVM 16-21 builds with a warning.
+- **llvm-tools**: `llvm-objdump` and `llvm-nm`. They are now resolved as an unversioned name, as `llvm-<tool>-<N>`, or from `llvm-config --bindir`, so Ubuntu's `llvm-15-dev` no longer needs symlinks in `/usr/local/bin`.
+- **vulkan** API 1.3 and timeline semaphores. Indium rejects older devices, so this stops the setup unless one device reports both the version and the semaphores, as `vulkaninfo` shows per GPU. An installed `vulkaninfo` that fails or times out is also required to be fixed, because the loader or the ICD files are then broken; without `vulkaninfo` at all it only warns, because the tool may be missing even when the driver is fine.
+- **x11** only warns: `DISPLAY` is probed with `xdpyinfo`, and the GL/EGL vendor is reported when a probe is installed. An inaccessible display is what made `iokitd` restart in a loop before [#140](https://github.com/lucannez64/darling-lol/issues/140); export `XAUTHORITY` from servers and SSH sessions. A build without a display is still valid.
+
+Run the same checks by hand, from the checkout:
+
+```sh
+python3 scripts/preflight.py
+python3 scripts/preflight.py --json
+```
+
+If a required check is stricter than your setup, `RCLOL_SKIP_PREFLIGHT=1 ./scripts/build.sh` (and the same for `scripts/install-runtime.sh`) skips the gate for that run. Include the preflight output when reporting a setup failure, and keep `--json` output when a tool needs to parse it.
 
 ## Memory installer: permission denied
 
@@ -149,6 +200,85 @@ ownership or window information cannot be read. A hidden background client or
 download is restarted when recovery is enabled. Other desktop environments are
 not supported by this helper; recovery is off by default.
 
+For a live Darling runtime with no visible client window but stale Riot/League/
+CEF processes at least 60 seconds old, `RCLOL_RECOVER_STALE_CLIENT=1` performs a
+partial recovery before the next launch. It keeps `darlingserver`, launchd/mldr,
+sockets and `.init.pid`, stops only the stale client process tree, and then lets
+the normal launcher start the product again. It recognizes `LeagueClientUx`,
+`Riot Client` and `RiotClientServices` windows, does nothing while a game process
+is running or when a managed client window is visible, and fails closed when
+X11/Xwayland properties are missing or unreadable. This saves the Darling
+bootstrap but not the Riot Client/CEF startup itself. The stale tree is signalled
+deepest-first so live parents can still reap their own children. Guest launchd
+periodically reaps untracked orphaned zombie children. Recovery reports the PID,
+state and parent of each process still present after SIGKILL; a surviving live
+process or a zombie owned by another parent may require further investigation.
+If processes remain or no window appears afterward, use a full runtime
+shutdown/restart.
+
+### Multiple client-in-game helpers
+
+The close/hide helper is a long-lived watcher. If an earlier launcher exits
+while it remains, the next launch can start another copy; list them with:
+
+```sh
+pgrep -af 'close-league-client-in-game.py|hide-league-client-in-game.py'
+```
+
+To remove the orphaned copies before the next helper starts:
+
+```sh
+RCLOL_CLEAN_STALE_HELPERS=1 ./scripts/run.sh
+```
+
+Only helpers of the current prefix whose parent is `init`/`systemd` are
+terminated. Helpers whose launcher is still alive, other prefixes, the game,
+Riot/League/CEF, `darlingserver` and the runtime are never touched. A dry run
+is available from the configured tools directory:
+
+```sh
+RCLOL_CLEAN_STALE_HELPERS=1 python3 build/runtime/tools/clean-stale-helpers.py --dry-run
+```
+
+## Launcher stays attached after closing the client
+
+`scripts/run.sh` keeps a supervisor between the terminal and Darling. It exists
+because the Riot Client does not exit when its window closes, and because a
+loader that dies before `darlingserver` can leave launchd/mldr and its client
+tree running. The supervisor:
+
+- forwards `Ctrl+C`, terminal close and `SIGTERM` to the loader, then shuts the
+  runtime down and stops anything still inside the guest PID namespace. A
+  process is only stopped when it carries this prefix's `__mldr_sockpath` and
+  the same user, and a namespace equal to the host's is refused, so another
+  prefix or a host process is never touched.
+- shuts the runtime down after the loader exits normally. If a second launch
+  attached to a runtime that was already running, that runtime is left alone.
+- leaves everything as it was with `RCLOL_CLEAN_ON_EXIT=0`, which is the old
+  `exec` behaviour.
+
+Runtime ownership is captured before startup helpers run, so a certificate refresh that starts Darling still belongs to this launcher. Leftover process cleanup checks the original start time, UID and PID namespace and sends signals through pidfds; if a process cannot be pinned, it is left alone and a surviving process is reported as a cleanup failure.
+
+Closing the client window is not the same as quitting the client. The window is
+gone but `RiotClientServices`, `LeagueClientUx` and their CEF helpers stay
+resident, and `xwininfo` can still list their windows. If closing the window
+should end the session, opt in to an idle stop:
+
+```sh
+RCLOL_STOP_AFTER_CLIENT_SECONDS=120 ./scripts/run.sh
+```
+
+The session stops after no managed League/Riot window and no game process have
+been seen for that many seconds, but only after a client window was seen. It
+never stops while a game runs, and it never stops when the window state cannot
+be read (for example a missing display or `xprop`), so a Wayland session without
+Xwayland still has to quit the client normally. The default is off.
+
+Quit the Riot Client itself (tray icon, then Quit) to end the session in every
+setup. If the launcher was killed with `SIGKILL`, or the whole terminal was
+terminated without a signal reaching the supervisor, the runtime still has to
+be stopped with `darling shutdown` as described below.
+
 ### Client window stays black after a match
 
 The League client keeps its Chromium/CEF UI (`LeagueClientUx` and its helpers)
@@ -190,6 +320,60 @@ observation, without waiting for a match:
 
 ```sh
 python3 tools/close-league-client-in-game.py --once --dry-run
+```
+
+### Automatic client handling during a match
+
+A single opt-in switch reads the client's own preferences and chooses the mode:
+
+```sh
+RCLOL_CLIENT_IN_GAME_TRICKS=1 ./scripts/run.sh
+```
+
+It reads `lol-user-experience` from the installed client's
+`LCULocalPreferences.yaml`:
+
+| Client preference | Launcher action |
+|---|---|
+| `potatoModeEnabled: false` or unreadable | no client-in-game helper |
+| `potatoModeEnabled: true`, close preference missing or invalid | no action |
+| `potatoModeEnabled: true`, `closeLeagueClientDuringGame: true` | close the client UI |
+| `potatoModeEnabled: true`, `closeLeagueClientDuringGame: false` | hide the client windows |
+
+The hide path unmaps the `LeagueClientUx` and `Riot Client` X11 windows and maps
+them again when the game process ends. The client is not closed, the League
+backend and Riot client keep running, and the game window is never hidden. The
+close path uses the UI-close helper described above. The hide helper exits after
+ten minutes without a client or match once it has seen one; a missing or invalid
+close preference selects no helper.
+
+The low-level `RCLOL_HIDE_CLIENT_IN_GAME=1` and
+`RCLOL_CLOSE_CLIENT_IN_GAME=1` switches remain available when the automatic
+switch is not set. All modes are off by default. The helpers are
+window-management only: they do not patch client binaries, CEF, anti-cheat or
+DRM. They attribute the game to this prefix through the loader's
+`__mldr_sockpath`, and fail closed when ownership, proc state, environment or
+window information cannot be read. The hide helper requires an X11 or Xwayland
+desktop; on a native Wayland window manager without Xwayland it cannot find the
+windows.
+
+On a CPU-bound host the hide effect appears after CEF has been hidden for a few
+seconds. In a local 30-second test on an i5-3470 with a Radeon RX 550, hiding
+`LeagueClientUx` reduced the summed CPU of the matched client/CEF processes from
+120.7% to 93.4% (about 23%, or 27 percentage points, of one core); showing the
+window returned it to 119.9%. This is not a universal FPS or percentage claim:
+a game that is GPU-bound, a client with no active UI work, or a different
+desktop may show less benefit. The hidden window can also need a moment to
+repaint after it is shown.
+
+With client optimizations enabled and close-during-game enabled, the close
+helper remains the more aggressive option when in-client chat during the match
+is not needed.
+
+Diagnose the match detector without changing any window:
+
+```sh
+python3 tools/hide-league-client-in-game.py --once
 ```
 
 ### Riot reports NO INTERNET FOUND while the host is online
@@ -345,6 +529,20 @@ The installer adds a CarbonCore framework override and the matching absolute Cor
 
 `iokitd` crashed in host glibc's `pthread_mutex_lock` and launchd restarted it every 10 seconds. It called `eglGetDisplay()` with an Xlib display, so Mesa picked the platform from `EGL_PLATFORM`. Wayland sessions often set that to `wayland`, and the first `darling` command passes its environment to every guest service, including `iokitd`. `scripts/run.sh` sets `EGL_PLATFORM=x11` and was unaffected, but `darling shell` from a Wayland terminal (including the one in `scripts/install-runtime.sh`) started the loop. `iokitd` now requests the X11 platform explicitly. The fix is part of the base install (`sudo cmake --install`); until then, start Darling with `EGL_PLATFORM=x11`.
 
+## `iokitd` restarts when the X display is not accessible
+
+`DISPLAY` can name an X server that rejects the connection, which is what an unset or stale `XAUTHORITY` does on a server, over SSH, or in a `sudo` session that dropped the cookie. `iokitd` opens `DISPLAY` and then falls back to `:0`, so the display is missing only when both fail. Previously it still called into EGL with a null display, so the process faulted and launchd restarted it in a loop while `/tmp/lolsig.log` filled with frames ([#140](https://github.com/lucannez64/darling-lol/issues/140)).
+
+`iokitd` now checks the display before EGL. When neither `DISPLAY` nor the `:0` fallback can be opened it prints one line (`iokitd: cannot open X display … or its :0 fallback; X11 surface acceleration disabled`) and keeps running, so `darling shell` starts instead of crash-looping. Surfaces then fail with `KERN_FAILURE`, which means the guest has no GPU rendering: export a cookie the user running Darling can read and start again, for example:
+
+```sh
+export XAUTHORITY=/run/user/$(id -u)/xauth
+# or, from a server install that keeps its cookie elsewhere:
+XAUTHORITY=$(ls /var/run/sddm/* | head -1) DISPLAY=:0 EGL_PLATFORM=x11 darling shell echo hola
+```
+
+`bash tools/env-check.sh` now probes the display with `xdpyinfo` in the environment Darling inherits, tries the `:0` fallback that `iokitd` uses, and warns only when both fail. That check is advisory: without X11/EGL the runtime still boots, but the game cannot render.
+
 ## Blocky video or flickering startup logo
 
 The first dynamically resolved GL call could lose floating-point arguments during ELF symbol lookup. Chromium's linear sampler request then failed and left nearest sampling. The generated resolver now preserves those registers. Install both the rebuilt native `libGL.dylib` in `RuntimeLibraries` and the OpenGL framework's library copy using the paired runtime installer; the framework alone is insufficient.
@@ -364,6 +562,31 @@ A separate multi-window path stopped the active async presenter when another dif
 - **Prebuilt Swift file contains Git LFS pointer text:** install Git LFS and fetch the original upstream assets; pointer text is not a usable library.
 - **Submodule fetch stops with no output right after `src/external/sqlite`:** the next submodule is `src/external/swift`, whose pinned `.lfsconfig` points at the retired `git-lfs.darlinghq.org`. The checkout is blocked on that host, not on sqlite. `prepare.py` redirects that submodule's LFS requests to GitHub. To finish a fetch that was interrupted before any patches were applied, run `git -C build/darling-src -c lfs.url=https://github.com/darlinghq/darling-swift.git/info/lfs submodule update --init --recursive --progress`, then re-run `./scripts/build.sh`. Do not run that submodule update once `prepare.py` has applied patches: it resets every submodule working tree to the pinned revision and discards the patches.
 
+## Checkout moved to another path or account
+
+`build/config.json`, the generated helpers and the CMake cache record absolute paths, so a checkout that was moved (for example from `/root/darling-lol` to `/home/<user>/darling-lol`, or renamed while staying in the same account) keeps pointing at the old location ([issue #142](https://github.com/lucannez64/darling-lol/issues/142)). `scripts/configure.py` now repairs the parts it owns and reports the rest on stderr:
+
+- **Prefix:** a saved prefix that was exactly `<previous home>/.darling` follows the new host home. A prefix you chose yourself is kept, and a prefix inside the previous home prints a reminder to pass `--prefix` explicitly.
+- **`build/runtime/build`:** recreated as a relative link, so it survives later moves. An absolute or dangling leftover is replaced; a real directory at that path is reported and left untouched.
+- **CMake cache:** a `build/darling-src/build/CMakeCache.txt` whose `CMAKE_HOME_DIRECTORY` names a different checkout is reported, together with the path to remove. It is never deleted automatically because it can hold local build state.
+
+After moving a checkout, run:
+
+```sh
+python3 scripts/configure.py
+```
+
+If the warning names another source directory, the cache still holds object files and dependency lists for the old path, and the build fails with `Permission denied` or `No such file or directory` against it. Remove it and rebuild (as the same user that owns the checkout):
+
+```sh
+rm -rf build/darling-src/build
+./scripts/build.sh
+```
+
+Patches are rendered at `scripts/prepare.py` time, so `@PROJECT_ROOT@` in a patched file keeps the old path until it runs again. `./scripts/build.sh` and `./scripts/update.sh` both do that; do not run `prepare.py` by hand while the checkout has other edits in `build/darling-src`, because it refuses rather than resetting them.
+
+The opt-in RenderDoc capture bridge (`RCLOL_RENDERDOC_CAPTURE=1`) is a developer diagnostic, not part of the installer. It expects `build/renderdoc/capture-bridge.so` and a RenderDoc build under `build/renderdoc/`, and neither setup script creates them. Without those files the capture is skipped and the game runs normally; the absolute path baked into the Indium patch is refreshed by the same `prepare.py` run.
+
 ## launchd crashes at boot after changing compiler flags
 
 `darling shell` fails with `Error connecting to shellspawn` and `/tmp/lolsig.log` shows `LOLSIGFAIL pid=1 sig=11 code=1 addr=0x0` in `memmove`, called from `snprintf` in libkqueue's `epoll_event_dump`. The binaries were tuned for AMD Zen: clang 23 with `-mtune=znver*` (also selected by `-march=native` or `-mtune=native` on Zen) loads a thread-local variable's descriptor into a register other than `%rdi`, but dyld's `tlv_get_addr` reads `%rdi`, so every `__thread` and `thread_local` access returns NULL. Rebuild with `-mtune=generic` (the default in `scripts/build.sh` and the overlay builders), and check any binary with:
@@ -376,7 +599,7 @@ It prints each thread-local access that calls its thunk without the descriptor i
 
 ## Base install refuses to continue while Darling is not running
 
-`sudo cmake --install` prints `Darling currently running for <user>, shutting it down...` several times and then `Darling launchd PID … remains alive after shutdown`. A guest launchd outlived its darlingserver, so `darling shutdown` sees no container to stop. Automatic cleanup by process name is disabled because guest names and UIDs do not prove prefix ownership (killing by name risks terminating an active launchd from an unrelated prefix or session). If setup is blocked, shut down the original Darling session from its own namespace (`darling shutdown`), or inspect the leftover PID under `/proc/<PID>` before terminating it manually.
+`sudo cmake --install` prints `Darling currently running for <user>, shutting it down...` several times and then `Darling launchd PID … remains alive after shutdown`. A guest launchd outlived its darlingserver, so `darling shutdown` sees no container to stop. Automatic cleanup by process name is disabled because guest names and UIDs do not prove prefix ownership (killing by name risks terminating an active launchd from an unrelated prefix or session). The launcher supervisor stops such leftovers when the session ends through `Ctrl+C`, a closed terminal or a normal client exit. If setup is already blocked, shut down the original Darling session from its own namespace (`darling shutdown`), or inspect the leftover PID under `/proc/<PID>` before terminating it manually.
 
 ## Lower fight FPS than Windows
 
@@ -411,6 +634,56 @@ With the window visual and compositor draw buffer fixes (#22) and the RPC socket
 
 If the game window stays black on NVIDIA, check `metal-device.log` as described in [Check which GPU rendered](#check-which-gpu-rendered).
 
+## Vulkan device or ICD selection
+
+The Metal wrapper renders with Vulkan and hands each frame to an OpenGL (EGL)
+context. If the machine has more than one Vulkan ICD, or a software Vulkan
+device such as lavapipe, the loader can enumerate a device that does not match
+the presenting GPU. The client may then stop with a Metal device or version
+error even though the runtime built correctly ([#127](https://github.com/lucannez64/darling-lol/issues/127)).
+
+Check what the loader reports and what Metal selected:
+
+```sh
+ls -l /usr/share/vulkan/icd.d/
+vulkaninfo --summary
+```
+
+The device log is opt-in and append-only. With the game and both clients closed,
+clear the old log and enable logging for one reproduction:
+
+```sh
+rm -f "${DPREFIX:-$HOME/.darling}/private/tmp/metal-device.log"
+DARLING_METAL_DEVICE_LOG=1 sh scripts/run.sh
+```
+
+After reproducing, inspect the `physical`, `selected` and `presenting` lines
+for the same process ID:
+
+```sh
+grep -E 'physical name|selected name|presenting GL' "${DPREFIX:-$HOME/.darling}/private/tmp/metal-device.log"
+```
+
+If the selected device is wrong, restrict Vulkan to the intended driver's ICD:
+
+```sh
+DARLING_METAL_DEVICE_LOG=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json sh scripts/run.sh
+```
+
+The filename is distribution and driver specific (`radeon_icd.x86_64.json`,
+`nvidia_icd.json` and `intel_icd.x86_64.json` are common). Choose the JSON for
+the GPU you want, and set this per launch; do not install it globally in a shell
+profile. `VK_ICD_FILENAMES` changes the Vulkan side only. If the log reports
+`MISMATCH`, the presenting OpenGL context is on another GPU; use the PRIME or
+EGL variables in [hybrid graphics](#hybrid-graphics-laptops-amdintel-igpu--nvidia)
+as well. If `physical name` shows `llvmpipe` or another CPU device, select the
+hardware ICD or enable [`/tmp/metal-skip-cpu-devices`](SETUP.md#metal-and-indium-overlays).
+
+This workaround selects an ICD/driver, which can expose several physical GPUs.
+It does not guarantee a particular GPU or a match with the OpenGL presenting
+GPU, and it does not make unsupported Metal features available. Include the `physical`, `selected` and `presenting` lines from
+`metal-device.log` when reporting the failure.
+
 ## Hybrid graphics laptops (AMD/Intel iGPU + NVIDIA)
 
 Metal renders with Vulkan, and each finished frame is handed to an OpenGL (EGL) context that presents it. The hand-off uses opaque file descriptors, which only work when Vulkan and OpenGL run on the same GPU. Indium takes the first Vulkan device the loader lists, and on a hybrid laptop both that device and the EGL context are normally the integrated GPU, so the discrete GPU stays idle. A report in [issue #3](https://github.com/lucannez64/darling-lol/issues/3) (Ryzen 9 5900HS, RTX 3060 Laptop) measured 60-70 FPS in ARAM on the integrated GPU; on the NVIDIA GPU the game showed a black screen, since fixed (see [NVIDIA](#nvidia)).
@@ -434,7 +707,7 @@ The guest file `/tmp/metal-gpu` (a device index or part of its name, for example
 
 ### Check which GPU rendered
 
-Each process that uses Metal appends to guest `/tmp/metal-device.log` (host `~/.darling/private/tmp/metal-device.log`): every Vulkan device the loader reported, the selected one and why, and the renderer of the presenting OpenGL context with both device UUIDs:
+With `DARLING_METAL_DEVICE_LOG=1` in the launcher environment, each process that uses Metal appends to guest `/tmp/metal-device.log` (host `~/.darling/private/tmp/metal-device.log`): every Vulkan device the loader reported, the selected one and why, and the renderer of the presenting OpenGL context with both device UUIDs. The log is off by default because the guest can read it and it names the host GPU:
 
 ```
 [MetalDevice] pid=… physical name="NVIDIA GeForce RTX 3060 Laptop GPU" type=discrete vendorID=0x10de … supported=yes
@@ -643,3 +916,36 @@ install the QuartzCore and OpenGL changes. Until updated, disable in-game
 VSync to use the game's frame cap, as the issue reporter confirmed. Physical
 scanout timing still depends on the driver and desktop compositor; the fix
 has standalone regression coverage but needs an in-game timing retest.
+
+## Installer aborts on `/proc/<pid>/fdinfo`
+
+[Issue #38](https://github.com/lucannez64/darling-lol/issues/38) reports an
+uncaught `ghc::filesystem::filesystem_error` with `Permission denied` on
+`/proc/<pid>/fdinfo`. `ghc::filesystem` is a C++ filesystem library, not evidence
+that the Riot installer is written in Haskell.
+
+An independent guest/native Vulkan probe reproduced this exact exception with
+MangoHud 0.8.4 enabled on 2026-10-18. MangoHud's `GPU_fdinfo::find_fd()` builds
+`/proc/<getpid()>/fdinfo` and uses a throwing directory iterator. Inside Darling,
+the native library's PID is in the guest PID namespace while its native `/proc`
+view can still refer to host processes: the probe's native PID 35 resolved to an
+inaccessible host process. The same probe completed Vulkan instance, device and
+swapchain creation with MangoHud disabled. This does not establish the cause of
+every installer abort; confirmation from the original reporter remains pending.
+
+The normal launcher now unsets `MANGOHUD` and exports `DISABLE_MANGOHUD=1` before
+runtime helpers start, including first-time installation. This disables inherited
+implicit MangoHud activation for the launched session without changing the host
+configuration. Do not wrap the launcher in `mangohud` or explicitly force its
+Vulkan layer. Updating these launcher scripts needs no Darling rebuild. For an
+older checkout, use:
+
+```sh
+env -u MANGOHUD DISABLE_MANGOHUD=1 ./scripts/installer.sh euw
+```
+
+Do not run the installer as root or change `/proc` permissions. If it still
+fails, include the exception and whether a host overlay was enabled; redact
+account tokens from logs.
+
+Upstream source: [MangoHud 0.8.4 fdinfo scan](https://github.com/flightlessmango/MangoHud/blob/v0.8.4/src/gpu_fdinfo.cpp#L9).

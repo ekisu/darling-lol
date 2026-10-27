@@ -55,6 +55,8 @@ Linux 5.14 or newer is required for `MADV_POPULATE_WRITE`, used when Darwin's al
 
 The runtime installer requires native `pkg-config` entries for `x11`, `x11-xcb`, `xcb-shm` and `xext`, plus the base Darling SDK.
 
+`scripts/build.sh` and `scripts/install-runtime.sh` start with `scripts/preflight.py`, which checks the host versions the build and the runtime need: Python, CMake, Git LFS, the kernel, LLVM and its command line tools, the Vulkan API level, and the X display. A required check that fails stops immediately with one actionable line; the display check only warns, because a build does not need one. Run it directly with `python3 scripts/preflight.py` (`--json` for a machine-readable report), and set `RCLOL_SKIP_PREFLIGHT=1` to bypass the gate for one run.
+
 Run configuration, builds and the per-user runtime installation as your ordinary account. Use sudo only for the base CMake installation and the incremental server installer. Running the whole build or per-user install under sudo can create root-owned files and configure the wrong guest home. `scripts/install-runtime.sh` initializes the default user prefix and creates `~/.darling/private/tmp` with mode `1777`, so the installer can write guest temporary files. It then shuts down Darling before replacing the paired runtime: first exit the game and both clients manually.
 
 The normal launcher starts neither an Electron inspector nor client API/UI helpers. It clears inherited `DYLD_INSERT_LIBRARIES`, retains Darling runtime library/framework overrides, supplies an absolute log directory to the launcher, and selects the League product. The log-directory/Chromium argument shim, empty-autofill hook and optional native VPX bridge are no longer injected or built by runtime installation. Existing copies on disk are inactive and may remain. Child-process log-directory rewriting and Chromium feature overrides previously supplied by the shim are removed; client startup without those workarounds needs manual validation. The first-time installer uses `--skip-to-install` and omits the installed client's `--app-root`, avoiding an immediate exit or inaccessible intro screen. The project ships no inspector hooks, client API helpers, input automation or client binary patches. Keep account data, logs and captures private.
@@ -77,6 +79,38 @@ to disable the CDN-only resolver workaround. `RCLOL_RECOVER_HIDDEN_CLIENT=1`
 opts in to Hyprland-only recovery of a default-prefix Riot session with no
 visible window; it is off by default. See [troubleshooting](TROUBLESHOOTING.md#riot-exits-and-league-reports-that-it-lost-its-connection)
 for the observed failures, recovery guards and NSURLSession limitations.
+
+`RCLOL_RECOVER_STALE_CLIENT=1` opts in to partial runtime recovery before
+launch. If `darlingserver` is alive, no game is running, no managed client
+window is visible and stale Riot/League/CEF processes at least 60 seconds old
+remain, the launcher stops only that client tree and reuses the runtime. It
+recognizes `LeagueClientUx`, `Riot Client` and `RiotClientServices` windows and
+preserves `darlingserver`, launchd/mldr, sockets and `.init.pid`; if X11/Xwayland
+properties cannot be inspected it does nothing. See
+[troubleshooting](TROUBLESHOOTING.md#client-remains-running-without-a-window).
+
+`RCLOL_CLEAN_STALE_HELPERS=1` runs a preflight before the match helper starts.
+It removes `close-league-client-in-game.py` and
+`hide-league-client-in-game.py` processes of this prefix whose parent is
+`init`/`systemd`, which means the launcher that started them has exited. A
+helper of a live launcher, another prefix, the game, Riot/League/CEF and
+`darlingserver` are preserved. It fails closed when a command line,
+environment, stat entry or parent cannot be read. See
+[troubleshooting](TROUBLESHOOTING.md#multiple-client-in-game-helpers).
+
+`RCLOL_CLIENT_IN_GAME_TRICKS=1` opts in to automatic client handling during a
+match. It reads `lol-user-experience` from the installed client's
+`LCULocalPreferences.yaml`: with `potatoModeEnabled: true`, it closes the client
+UI when `closeLeagueClientDuringGame: true`, and hides the managed
+`LeagueClientUx`/`Riot Client` X11 windows when that value is false. Missing or
+invalid preference values, disabled client optimizations and unreadable files
+select no action. The low-level `RCLOL_CLOSE_CLIENT_IN_GAME=1` and
+`RCLOL_HIDE_CLIENT_IN_GAME=1` switches remain available when the automatic
+switch is not set. The feature is off by default, requires X11/Xwayland, and
+does not patch client binaries, CEF or the game. The hide helper exits after ten
+minutes without a client or match once it has seen one. See
+[the troubleshooting measurement](TROUBLESHOOTING.md#automatic-client-handling-during-a-match)
+for the measured CPU effect and limitations.
 
 `RCLOL_FILTER_HOST_ENV=1` opts in to removing host desktop-session variables before
 the guest starts: `WAYLAND_DISPLAY`, `XDG_SESSION_*`, `XDG_CURRENT_DESKTOP`,
@@ -164,7 +198,7 @@ The hand-off experiments (`metal-present-dispatch-wait`, `metal-deferred-blit` a
 | `/tmp/metal-skip-cpu-devices` | software Vulkan devices (lavapipe) are skipped while a hardware device exists |
 | `/tmp/metal-gpu` | diagnostic: selects the Vulkan device used for Metal by index or case-insensitive name substring instead of the loader's first device. The OpenGL context that presents does not follow it; see [hybrid laptops](TROUBLESHOOTING.md#hybrid-graphics-laptops-amdintel-igpu--nvidia). `METAL_INDIUM_GPU` is the environment equivalent; the file wins |
 | `/tmp/metal-all-devices` | a `VkDevice` is created for every supported Vulkan device, as before 2026-10-16. Without it only the selected device gets one; on a machine with lavapipe installed this also drops lavapipe's idle rasterizer threads |
-| `/tmp/metal-no-drawable-vram` | drawables of a layer with `framebufferOnly` off (League sets it off) go back to host-visible system RAM, as before 2026-10-16. Without the file they are allocated in GPU memory like `framebufferOnly` drawables; nothing maps drawable memory from the CPU. On the RX 6600 this gave about 20 FPS more in a practice-tool fight and the same FPS when idle, not yet measured in an ARAM. `/tmp/metal-device.log` shows `drawable-vram=on` and `storage=vram` |
+| `/tmp/metal-no-drawable-vram` | drawables of a layer with `framebufferOnly` off (League sets it off) go back to host-visible system RAM, as before 2026-10-16. Without the file they are allocated in GPU memory like `framebufferOnly` drawables; nothing maps drawable memory from the CPU. On the RX 6600 this gave about 20 FPS more in a practice-tool fight and the same FPS when idle, not yet measured in an ARAM. `/tmp/metal-device.log` (with `DARLING_METAL_DEVICE_LOG=1`) shows `drawable-vram=on` and `storage=vram` |
 | `/tmp/metal-no-lazy-wakeup` | every completion registration signals the event loop's wake-up semaphore from the CPU again, as before 2026-10-18. The handshake is per device. Without the file a registration signals only while the poller has announced a blocking wait (a spinning poller re-reads the registrations on its next pass, and its spin ends when one arrives). On the NVIDIA proprietary driver each `vkSignalSemaphore` is an RM control ioctl that waits on a driver-wide lock, about 0.3 ms each and ~25 per League frame, and it was the largest kernel cost of the submit worker. Read once per game process; the wait log counts `wakeupSignalled` and `wakeupSkipped` |
 | `/tmp/metal-submit-batch-us` | the submit batch window in microseconds (500–100000, default 500); read once per game process, so set it before the game starts. A presenting commit and every CPU wait still flush the batch at once. On the NVIDIA proprietary driver every `vkQueueSubmit2` is an RM control ioctl that waits on a driver-wide lock (about 0.4 ms each in a League match); with the default window a frame took about 8.5 submits, with `5000` about 2.5 (RTX 4090: 89 → 113 FPS, same match) |
 | `/tmp/metal-submit-batch-max` | command buffers per batch (1–256, default 16), read once like the window; `64` lets one batch hold a whole frame |

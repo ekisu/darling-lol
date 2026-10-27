@@ -23,7 +23,7 @@
 
 If someone else wants to contact me know that i'm open to jobs, part-time remote only as a employee and full time remote as a freelancer for a mission
 
-A short manual ARAM run and the current compatibility status are documented in [docs/STATUS.md](docs/STATUS.md).
+A short manual ARAM run and the current compatibility status are documented in [docs/STATUS.md](docs/STATUS.md). Real machines that have played, and their measured frame times, are listed in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md); `darling-lol --doctor` and `darling-lol --perf` produce the data for a new row.
 
 Experimental source patches and tools for running the **macOS League of Legends client on x86-64 Linux through Darling**.
 
@@ -36,12 +36,12 @@ This is a development snapshot, not a finished launcher. Riot and League clients
 - Reusable server receive buffers and Darwin allocator hints translated to Linux lazy reclamation.
 - Build/install/launch wrappers, atomic incremental installers and standalone regression probes.
 
-Game files, Riot installers, account databases, tokens, local prefixes, captures and compiled binaries are not included. Install the game manually through Riot. The normal launcher does not enable an Electron inspector or start UI automation helpers. The launcher clears `DYLD_INSERT_LIBRARIES` and retains Darling runtime library/framework overrides; this is not a claim of approval by Riot.
+Game files, Riot installers, account databases, tokens, local prefixes, captures and compiled binaries are not included. Install the game manually through Riot. The normal launcher does not enable an Electron inspector or start UI automation helpers; the opt-in window-management helpers described below are off by default and do not patch client binaries. The launcher clears `DYLD_INSERT_LIBRARIES` and retains Darling runtime library/framework overrides; this is not a claim of approval by Riot.
 
 ## Requirements
 
 - x86-64 Linux **5.14 or newer**, an X11 session or Xwayland, and a working hardware Vulkan/OpenGL driver. AMD RADV and the NVIDIA driver (proprietary and open kernel modules) have been exercised, see [NVIDIA](docs/TROUBLESHOOTING.md#nvidia); other drivers are not validated. Hybrid laptops usually render on the integrated GPU unless started with PRIME offload. See [hybrid graphics](docs/TROUBLESHOOTING.md#hybrid-graphics-laptops-amdintel-igpu--nvidia).
-- Git + Git LFS, Bash, curl, unzip, CMake, Make, Clang/LLD, LLVM development files, a C/C++ compiler, Python 3.12+ and the Darling build dependencies. The patch includes LLVM 22/23 branch-opcode compatibility; the new PC used LLVM/Clang 23. Node.js is needed only for the offline JavaScript checks.
+- Git + Git LFS (2.13 or newer), Bash, curl, unzip, CMake 3.20+, Make, Clang/LLD, LLVM development files (16 or newer), a C/C++ compiler, Python 3.10+ and the Darling build dependencies. `scripts/build.sh` and `scripts/install-runtime.sh` run `scripts/preflight.py` first and stop on a version that cannot build or run the result; `RCLOL_SKIP_PREFLIGHT=1` bypasses that gate. The patch includes LLVM 22/23 branch-opcode compatibility, and LLVM 22 or 23 is what the Metal overlays are tested with. Node.js is needed only for the offline JavaScript checks.
 - X11/XCB/SHM development files for the current runtime helpers.
 - Enough free disk for Darling sources/build, Git LFS assets and the game: budget at least 50 GB. Building is substantially larger than this source-only repository.
 
@@ -109,9 +109,52 @@ First installation and future Riot updates can still encounter compatibility gap
 
 For another region, set `RCLOL_REGION` and `RCLOL_LOCALE` before launch. For example `RCLOL_REGION=NA RCLOL_LOCALE=en_US ./scripts/run.sh`. Linux display selection follows `$DISPLAY`; the legacy launcher fallback is `:1`.
 
+If the game or Riot client was closed but `darlingserver` is still running, opt in to partial recovery before the next launch:
+
+```sh
+RCLOL_RECOVER_STALE_CLIENT=1 ./scripts/run.sh
+```
+
+It stops only a windowless Riot/League/CEF tree at least 60 seconds old,
+preserves `darlingserver`, launchd/mldr, sockets and `.init.pid`, and then
+starts the product normally. It recognizes `LeagueClientUx`, `Riot Client` and
+`RiotClientServices` windows, does nothing while a game or managed client window
+is present, and fails closed when X11 properties cannot be read. See
+[troubleshooting](docs/TROUBLESHOOTING.md#client-remains-running-without-a-window).
+
+If repeated launches leave several `close-league-client-in-game.py` watchers,
+opt in to removing the orphaned ones before the new helper starts:
+
+```sh
+RCLOL_CLEAN_STALE_HELPERS=1 ./scripts/run.sh
+```
+
+It only removes helpers of this prefix whose parent is `init`/`systemd` (the
+launcher that started them has exited). A helper of a live launcher, another
+prefix, the game, Riot/League/CEF, `darlingserver` and the runtime are never
+touched. See [troubleshooting](docs/TROUBLESHOOTING.md#multiple-client-in-game-helpers).
+
+For automatic client handling during a match, opt in with one switch:
+
+```sh
+RCLOL_CLIENT_IN_GAME_TRICKS=1 ./scripts/run.sh
+```
+
+It reads `lol-user-experience` from the installed League client's
+`LCULocalPreferences.yaml`. When `potatoModeEnabled` is true, it closes the
+client UI if `closeLeagueClientDuringGame` is true, and hides the
+`LeagueClientUx`/`Riot Client` X11 windows when that value is false. Missing or
+invalid preference values, disabled client optimizations and unreadable files
+select no action. The `RCLOL_CLOSE_CLIENT_IN_GAME` and
+`RCLOL_HIDE_CLIENT_IN_GAME` low-level switches remain available when the
+automatic switch is not set. The helper exits after ten minutes without a
+client or match once it has seen one. See
+[troubleshooting](docs/TROUBLESHOOTING.md#automatic-client-handling-during-a-match)
+for the measured effect and caveats.
+
 ## Testing
 
-Start with standalone regression checks, then play a match manually. See [testing](docs/TESTING.md). Do not attach a debugger, query client APIs, inject diagnostic hooks or automate client/game input. This project ships no client-side automation, inspection or profiling helpers.
+Start with standalone regression checks, then play a match manually. See [testing](docs/TESTING.md). Do not attach a debugger, query client APIs, inject diagnostic hooks or automate client/game input. The project includes standalone compatibility probes and the opt-in host-side window-management helpers described above, but no client injection hooks, client API automation or input automation; the normal launcher enables none of them.
 
 FPS counters, game presentation requests and physical display refresh are different measurements. Record average and p99 frame times, the active scene, graphics settings, charger/power state and whether the game stayed focused. See [current status](docs/STATUS.md).
 
@@ -136,11 +179,15 @@ scripts/             portable entry points
 upstream/manifest.json  exact base revisions and patch ownership
 patches/             current source changes, one patch per repository
 tools/               runtime templates, installers and standalone regression probes
-docs/                setup, testing, status and licensing notes
+docs/                setup, testing, status, compliance and interoperability notes
 build/               local sources, outputs and rendered tools (ignored)
 ```
 
 Darling/upstream components retain their existing licenses; see [third-party notes](NOTICE.md). Original integration tooling is distributed under GPL-3.0; patches retain the licensing of their target files.
+
+## Interoperability and compliance
+
+This project is an unofficial interoperability effort. It distributes source patches for Darling and original tooling, not the Riot client, game code, assets or accounts. The normal launcher does not patch the client, game, CEF or anti-cheat. Users obtain the client from Riot and are responsible for complying with Riot's terms; account restrictions are possible. See [interoperability and compliance scope](docs/INTEROPERABILITY.md) and [compliance guidance](docs/COMPLIANCE.md). Neither document is legal advice.
 
 ## Trademarks
 
@@ -149,7 +196,9 @@ This project is an unofficial compatibility effort and is not affiliated with, e
 sponsored by Riot Games. No game client, game assets, or account data are distributed in this
 repository.
 
-See [compliance and terminology guidance](docs/COMPLIANCE.md) for the project's scope and
-review expectations.
+See [compliance and terminology guidance](docs/COMPLIANCE.md) and [interoperability and compliance scope](docs/INTEROPERABILITY.md) for the project's scope and review expectations.
 
+## Donations
 
+If you want to help me live or just pay me a coffee
+you can at [Ko-Fi](https://ko-fi.com/lucannez64)
