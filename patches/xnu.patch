@@ -839,6 +839,31 @@ index 5d4beb5..9d5de46 100644
  
  long sys_ptrace(int request, int pid, void* addr, int data);
  
+diff --git a/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/network/sendto.h b/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/network/sendto.h
+index 2d793c9..fdea88d 100644
+--- a/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/network/sendto.h
++++ b/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/network/sendto.h
+@@ -6,6 +6,20 @@ long sys_sendto(int fd, const void* buffer, unsigned long length,
+ long sys_sendto_nocancel(int fd, const void* buffer, unsigned long length,
+ 		int flags, const void* sockaddr, int socklen);
+ 
++// XNU returns system call results in rax and rdx and clears rdx for sendto.
++// Chromium checks rdx after sendto (crbug.com/40064248) and treats a non-zero
++// value as a bogus return, failing the write with ERR_NETWORK_CHANGED.
++struct xnu_syscall_return_pair
++{
++	long value;
++	long secondary;
++};
++
++struct xnu_syscall_return_pair sys_sendto_trap(int fd, const void* buffer, unsigned long length,
++		int flags, const void* sockaddr, int socklen);
++struct xnu_syscall_return_pair sys_sendto_nocancel_trap(int fd, const void* buffer, unsigned long length,
++		int flags, const void* sockaddr, int socklen);
++
+ #define LINUX_SYS_SENDTO	11
+ 
+ #endif // LINUX_SENDTO_H
 diff --git a/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/psynch/ulock_wait.h b/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/psynch/ulock_wait.h
 index 90bc146..5bcea21 100644
 --- a/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/psynch/ulock_wait.h
@@ -2107,7 +2132,7 @@ index 8c6d5d9..6fd1acf 100644
  }
  
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/bsd_syscall_table.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/bsd_syscall_table.c
-index 7d5ef80..46debb8 100644
+index 7d5ef80..013b735 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/bsd_syscall_table.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/bsd_syscall_table.c
 @@ -24,6 +24,7 @@
@@ -2126,6 +2151,15 @@ index 7d5ef80..46debb8 100644
  #include <darling/emulation/xnu_syscall/bsd/impl/misc/proc_info.h>
  #include <darling/emulation/xnu_syscall/bsd/impl/misc/ptrace.h>
  #include <darling/emulation/xnu_syscall/bsd/impl/misc/reboot.h>
+@@ -303,7 +305,7 @@ void* __bsd_syscall_table[600] = {
+ 	[128] = sys_rename,
+ 	[131] = sys_flock,
+ 	[132] = sys_mkfifo,
+-	[133] = sys_sendto,
++	[133] = sys_sendto_trap,
+ 	[134] = sys_shutdown,
+ 	[135] = sys_socketpair,
+ 	[136] = sys_mkdir,
 @@ -427,6 +429,7 @@ void* __bsd_syscall_table[600] = {
  	[369] = sys_kevent64,
  	[372] = sys_thread_selfid,
@@ -2134,6 +2168,15 @@ index 7d5ef80..46debb8 100644
  	[394] = sys_pselect,
  	[395] = sys_pselect_nocancel,
  	[396] = sys_read_nocancel,
+@@ -446,7 +449,7 @@ void* __bsd_syscall_table[600] = {
+ 	[410] = sys_sigsuspend_nocancel,
+ 	[411] = sys_readv_nocancel,
+ 	[412] = sys_writev_nocancel,
+-	[413] = sys_sendto_nocancel,
++	[413] = sys_sendto_nocancel_trap,
+ 	[414] = sys_pread_nocancel,
+ 	[415] = sys_pwrite_nocancel,
+ 	[417] = sys_poll_nocancel,
 @@ -462,6 +465,7 @@ void* __bsd_syscall_table[600] = {
  	[441] = sys_guarded_open_np,
  	[442] = sys_guarded_close_np,
@@ -2502,10 +2545,10 @@ index f273989..7257f2a 100644
 +	return 0;
 +}
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c
-index bd9cdc2..81ed99f 100644
+index bd9cdc2..af786f7 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c
-@@ -23,6 +23,11 @@
+@@ -23,6 +23,12 @@
  enum {
  	_KERN_MSGBUF = 1000,
  	_KERN_OSPRODUCTVERSION,
@@ -2514,10 +2557,11 @@ index bd9cdc2..81ed99f 100644
 +	_KERN_BOOTARGS,
 +	_KERN_TSCM_AVAILABLE,
 +	_KERN_NUM_FILES,
++	_KERN_HV_VMM_PRESENT,
  
  	_KERN_SEMMNS = 1000,
  };
-@@ -38,6 +43,11 @@ static sysctl_handler(handle_domainname);
+@@ -38,6 +44,11 @@ static sysctl_handler(handle_domainname);
  static sysctl_handler(handle_osrelease);
  static sysctl_handler(handle_version);
  static sysctl_handler(handle_osversion);
@@ -2529,9 +2573,19 @@ index bd9cdc2..81ed99f 100644
  static sysctl_handler(handle_maxproc);
  static sysctl_handler(handle_netboot);
  static sysctl_handler(handle_safeboot);
-@@ -76,6 +86,11 @@ const struct known_sysctl sysctls_kern[] = {
+@@ -45,6 +56,7 @@ static sysctl_handler(handle_usrstack32);
+ static sysctl_handler(handle_usrstack64);
+ static sysctl_handler(handle_sysv_semmns);
+ static sysctl_handler(handle_osproductversion);
++static sysctl_handler(handle_hv_vmm_present);
+ static sysctl_handler(handle_osrevision);
+ 
+ extern int _sysctl_proc(int what, int flag, struct kinfo_proc* out, unsigned long* buflen);
+@@ -75,7 +87,13 @@ const struct known_sysctl sysctls_kern[] = {
+ 	{ .oid = KERN_USRSTACK32, .type = CTLTYPE_INT, .exttype = "I", .name = "usrstack", .handler = handle_usrstack32 },
  	{ .oid = KERN_USRSTACK64, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "usrstack64", .handler = handle_usrstack64 },
  	{ .oid = _KERN_OSPRODUCTVERSION, .type = CTLTYPE_STRING, .exttype = "S", .name = "osproductversion", .handler = handle_osproductversion },
++	{ .oid = _KERN_HV_VMM_PRESENT, .type = CTLTYPE_INT, .exttype = "I", .name = "hv_vmm_present", .handler = handle_hv_vmm_present },
  	{ .oid = KERN_OSREV, .type = CTLTYPE_INT, .exttype = "I", .name = "osrevision", .handler = handle_osrevision },
 +	{ .oid = _KERN_SECURE_KERNEL, .type = CTLTYPE_INT, .exttype = "I", .name = "secure_kernel", .handler = handle_secure_kernel },
 +	{ .oid = _KERN_OSVARIANT_STATUS, .type = CTLTYPE_INT, .exttype = "I", .name = "osvariant_status", .handler = handle_osvariant_status },
@@ -2541,7 +2595,7 @@ index bd9cdc2..81ed99f 100644
  	{ .oid = KERN_SYSV, .type = CTLTYPE_NODE, .exttype = "", .name = "sysv", .subctls = sysctls_kern_sysv },
  	{ .oid = -1 }
  };
-@@ -139,18 +154,23 @@ sysctl_handler(handle_boottime)
+@@ -139,18 +157,23 @@ sysctl_handler(handle_boottime)
  	// Fill in struct timeval { tv_sec, tv_usec }
  	struct sysinfo info;
  	struct bsd_timeval* tv;
@@ -2571,7 +2625,7 @@ index bd9cdc2..81ed99f 100644
  
  		// we don't want the microseconds to be constantly jumping around
  		// (that actually causes an infinite loop in `_mach_boottime_usec` in libc)
-@@ -213,7 +233,9 @@ sysctl_handler(handle_hostname)
+@@ -213,7 +236,9 @@ sysctl_handler(handle_hostname)
  	int rv = 0;
  	
  	need_uname();
@@ -2582,7 +2636,7 @@ index bd9cdc2..81ed99f 100644
  	
  	if (_new && newlen > 0)
  	{
-@@ -326,7 +348,73 @@ sysctl_handler(handle_usrstack64)
+@@ -326,7 +351,73 @@ sysctl_handler(handle_usrstack64)
  	return 0;
  }
  
@@ -2657,6 +2711,21 @@ index bd9cdc2..81ed99f 100644
  	copyout_string(EMULATED_OSPRODUCTVERSION, (char*)old, oldlen);
  	return 0;
  };
+@@ -342,3 +433,14 @@ static sysctl_handler(handle_osrevision) {
+ 	*oldlen = sizeof(*ovalue);
+ 	return 0;
+ }
++
++static sysctl_handler(handle_hv_vmm_present)
++{
++	// darling-lol: the sysctl identity is a bare-metal MacBookPro16,1, which answers 0.
++	// Mirroring the host CPUID hypervisor bit would leak a VM host and contradict the
++	// masked CPU (machdep.cpu.features has no VMM flag); a raw CPUID here would also
++	// fault in processes started with DARLING_CPUID_FAULT=1.
++	sysctl_handle_size(sizeof(int));
++	*((int*) old) = 0;
++	return 0;
++}
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
 index 4319355..577dd10 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
@@ -3880,6 +3949,35 @@ index be2926c..a25882e 100644
 +	*port = (int)port_name;
  	return 0;
  }
+diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/getrlimit.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/getrlimit.c
+index 01d4670..664c7a8 100644
+--- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/getrlimit.c
++++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/getrlimit.c
+@@ -18,12 +18,22 @@ long sys_getrlimit(unsigned int which, struct xnu_rlimit* rlp)
+ 	if (ret < 0)
+ 		ret = errno_linux_to_bsd(ret);
+ 
++	if (ret < 0)
++		return ret;
++
+ 	if (which == LINUX_RLIMIT_NOFILE)
+ 	{
+-		rlp->rlim_cur--;
+-		rlp->rlim_max--;
++		if (rlp->rlim_cur != ~0ULL)
++			rlp->rlim_cur--;
++		if (rlp->rlim_max != ~0ULL)
++			rlp->rlim_max--;
+ 	}
+ 
++	if (rlp->rlim_cur > 0x7fffffffffffffffULL)
++		rlp->rlim_cur = 0x7fffffffffffffffULL;
++	if (rlp->rlim_max > 0x7fffffffffffffffULL)
++		rlp->rlim_max = 0x7fffffffffffffffULL;
++
+ 	return ret;
+ }
+ 
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/mac_syscall.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/mac_syscall.c
 new file mode 100644
 index 0000000..479294a
@@ -4209,6 +4307,30 @@ index 0a8f1e4..a19f12e 100644
  	}
  
  	if (cmd != NULL)
+diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/setrlimit.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/setrlimit.c
+index 352c739..a315c2a 100644
+--- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/setrlimit.c
++++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/setrlimit.c
+@@ -15,10 +15,17 @@ long sys_setrlimit(unsigned int which, const struct xnu_rlimit* rlp)
+ 	if (which == -1)
+ 		return -EINVAL;
+ 
++	if (lim.rlim_cur >= 0x7fffffffffffffffULL)
++		lim.rlim_cur = ~0ULL;
++	if (lim.rlim_max >= 0x7fffffffffffffffULL)
++		lim.rlim_max = ~0ULL;
++
+ 	if (which == LINUX_RLIMIT_NOFILE)
+ 	{
+-		lim.rlim_cur++;
+-		lim.rlim_max++;
++		if (lim.rlim_cur != ~0ULL)
++			lim.rlim_cur++;
++		if (lim.rlim_max != ~0ULL)
++			lim.rlim_max++;
+ 	}
+ 
+ 	ret = LINUX_SYSCALL(__NR_prlimit64, 0, which, &lim, 0);
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/sysctl.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/sysctl.c
 index 10f39a5..0e380b6 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/sysctl.c
@@ -4498,6 +4620,28 @@ index 927ccbb..ae353d3 100644
  
  	if (ret < 0)
  		ret = errno_linux_to_bsd(ret);
+diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/network/sendto.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/network/sendto.c
+index 820a7eb..1416100 100644
+--- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/network/sendto.c
++++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/network/sendto.c
+@@ -51,3 +51,17 @@ long sys_sendto_nocancel(int fd, const void* buffer, unsigned long length,
+ 
+ 	return ret;
+ }
++
++struct xnu_syscall_return_pair sys_sendto_trap(int fd, const void* buffer, unsigned long length,
++		int flags, const void* sockaddr, int socklen)
++{
++	struct xnu_syscall_return_pair result = { sys_sendto(fd, buffer, length, flags, sockaddr, socklen), 0 };
++	return result;
++}
++
++struct xnu_syscall_return_pair sys_sendto_nocancel_trap(int fd, const void* buffer, unsigned long length,
++		int flags, const void* sockaddr, int socklen)
++{
++	struct xnu_syscall_return_pair result = { sys_sendto_nocancel(fd, buffer, length, flags, sockaddr, socklen), 0 };
++	return result;
++}
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/process/fork.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/process/fork.c
 index 76b6f53..a6c24ff 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/process/fork.c
