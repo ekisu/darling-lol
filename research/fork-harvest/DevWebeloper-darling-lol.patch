@@ -1,0 +1,1846 @@
+From 5f13d67a50e6b0a44db60f96874d8a07e7276b1c Mon Sep 17 00:00:00 2001
+From: DevWebeloper <gheith.sy@gmail.com>
+Date: Mon, 19 Oct 2026 22:21:11 +0300
+Subject: [PATCH] feat(stealth): align CPU sysctl, Metal GPU, and SMBIOS
+ telemetry with MacBookPro16,1 spec
+
+- Metal framework: support DARLING_METAL_GPU_NAME and DARLING_METAL_VRAM_MB to prevent host Vulkan device strings from leaking into Metal telemetry
+- XNU emulation: implement binary integer sysctls for machdep.cpu.vendor (GenuineIntel), family, model, stepping, hw.product, hw.targettype, and kern.hv_vmm_present=0
+- System profiler: emulate authentic dual GPU configuration (AMD Radeon Pro 5500M + Intel UHD Graphics 630)
+- Process teardown: ignore zombie processes (State: Z) in process scanners, ensure robust cleanup of orphan darlingserver and Riot helpers
+- Launchers: propagate DARLING_METAL_GPU_NAME and DARLING_METAL_VRAM_MB across launch-fork, run.sh, and run-riot-client; shield launch-upstream with redirection warning
+- Tests: add coverage for launcher warnings, zombie process filtering, and Metal device telemetry
+---
+ patches/darling.patch               |  30 +-
+ patches/metal.patch                 | 100 ++++--
+ patches/xnu.patch                   | 517 ++++++++++++++++++++++++----
+ scripts/launch-fork.sh              |  10 +-
+ scripts/run.sh                      |   6 +
+ scripts/validate.py                 |   4 +-
+ tests/test_launchers.py             |  35 ++
+ tests/test_stop_darling_runtime.py  |  22 ++
+ tools/darling-system_profiler.sh    |  93 ++++-
+ tools/ensure-darling-runtime.py     |  27 +-
+ tools/gen-darling-smbios.py         |  65 +++-
+ tools/riot-smbios-hardware-check.py |  56 ++-
+ tools/run-riot-client.sh            |   2 +
+ tools/stop-darling-runtime.py       |  94 +++--
+ tools/test-metal-device-info.cpp    |   4 +
+ 15 files changed, 904 insertions(+), 161 deletions(-)
+
+diff --git a/patches/darling.patch b/patches/darling.patch
+index ae2cfd8..026fc04 100644
+--- a/patches/darling.patch
++++ b/patches/darling.patch
+@@ -11291,10 +11291,36 @@ index 0000000..1f3c473
+ +}
+ +#endif
+ diff --git a/src/startup/mldr/elfcalls/threads.c b/src/startup/mldr/elfcalls/threads.c
+-index e789986..0d56b4e 100644
++index e789986ea..8258909a6 100644
+ --- a/src/startup/mldr/elfcalls/threads.c
+ +++ b/src/startup/mldr/elfcalls/threads.c
+-@@ -387,8 +387,9 @@ int __darling_thread_rpc_socket(void) {
++@@ -37,6 +37,13 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
++ 
++ #include <darlingserver/rpc.h>
++ 
+++#ifndef __NR_arch_prctl
+++#define __NR_arch_prctl 158
+++#endif
+++#ifndef ARCH_SET_CPUID
+++#define ARCH_SET_CPUID 0x1012
+++#endif
+++
++ extern int __mldr_create_rpc_socket(void);
++ extern void __mldr_close_rpc_socket(int socket);
++ 
++@@ -209,6 +216,11 @@ static void* darling_thread_entry(void* p)
++ 
++ 	memcpy(&args, in_args, sizeof(args));
++ 
+++#if defined(__x86_64__)
+++	/* darling-lol: ensure CPUID fault trapping is active on newly spawned threads */
+++	syscall(__NR_arch_prctl, ARCH_SET_CPUID, 0);
+++#endif
+++
++ 	dthread_t dthread = args.pth;
++ 	uintptr_t* flags = args.is_workqueue ? &args.arg2 : &args.arg3;
++ 
++@@ -387,8 +399,9 @@ int __darling_thread_rpc_socket(void) {
+  			// this is the main thread
+  			t_server_socket = __dserver_main_thread_socket_fd;
+  		} else {
+diff --git a/patches/metal.patch b/patches/metal.patch
+index 597b074..7f2e27a 100644
+--- a/patches/metal.patch
++++ b/patches/metal.patch
+@@ -1134,7 +1134,7 @@ index 2a57796..0cbedf2 100644
+ -
+  @end
+ diff --git a/src/Metal/MTLDevice.mm b/src/Metal/MTLDevice.mm
+-index f58184a..2c45608 100644
++index f58184a..dcd5041 100644
+ --- a/src/Metal/MTLDevice.mm
+ +++ b/src/Metal/MTLDevice.mm
+ @@ -2,14 +2,32 @@
+@@ -1218,7 +1218,7 @@ index f58184a..2c45608 100644
+  }
+  
+  @synthesize device = _device;
+-@@ -116,6 +168,50 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -116,6 +168,46 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  	[_threadExitCondition unlock];
+  }
+  
+@@ -1228,25 +1228,25 @@ index f58184a..2c45608 100644
+ +	// Overrides are read once per process.
+ +	static const char* const nameOverride = getenv("DARLING_METAL_GPU_NAME");
+ +	static const uint64_t vramOverride = MTLDeviceInfo::parseMegabytes(getenv("DARLING_METAL_VRAM_MB"));
+-+	static const bool macName = [] {
+-+		const char* value = getenv("DARLING_METAL_MAC_GPU_NAME");
+-+		return value && value[0] == '1' && value[1] == '\0';
+++	static const bool useHost = [] {
+++		const char* v = getenv("DARLING_METAL_USE_HOST_GPU");
+++		return v && v[0] == '1' && v[1] == '\0';
+ +	}();
+ +
+ +	auto priv = dynamic_cast<Indium::PrivateDevice*>(_device.get());
+++	uint32_t vendorID = priv ? priv->properties().vendorID : 0;
+ +	std::string vulkanName;
+ +	try {
+ +		vulkanName = _device ? _device->name() : "";
+ +	} catch (...) {
+ +		vulkanName = "";
+ +	}
+-+	const char* mac = macName && priv ? MTLDeviceInfo::macGpuName(priv->properties().vendorID) : nullptr;
+-+	_name = [[NSString alloc] initWithUTF8String: MTLDeviceInfo::resolveName(nameOverride, vulkanName.c_str(), mac).c_str()];
+++	_name = [[NSString alloc] initWithUTF8String: MTLDeviceInfo::resolveDeviceName(nameOverride, vulkanName.c_str(), useHost, vendorID).c_str()];
+ +	if (_name == nil) {
+ +		_name = [[NSString alloc] initWithUTF8String: MTLDeviceInfo::kFallbackName];
+ +	}
+ +
+-+	uint64_t workingSet = 0;
+++	uint64_t hostWorkingSet = 0;
+ +	_sharesSystemMemory = NO;
+ +	if (priv) {
+ +		const VkPhysicalDeviceType type = priv->properties().deviceType;
+@@ -1257,19 +1257,15 @@ index f58184a..2c45608 100644
+ +		for (size_t i = 0; i < count; ++i) {
+ +			heaps[i] = { memory.memoryHeaps[i].size, (memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 };
+ +		}
+-+		workingSet = MTLDeviceInfo::workingSetBytes(heaps, count, _sharesSystemMemory);
+-+	}
+-+	if (vramOverride != 0) {
+-+		workingSet = vramOverride;
+++		hostWorkingSet = MTLDeviceInfo::workingSetBytes(heaps, count, _sharesSystemMemory);
+ +	}
+-+	// 1 GiB was the previous fixed value; keep it when Vulkan reports nothing usable.
+-+	_workingSetSize = workingSet != 0 ? workingSet : (1ull << 30);
+++	_workingSetSize = MTLDeviceInfo::resolveWorkingSetBytes(vramOverride, hostWorkingSet, useHost, vendorID);
+ +}
+ +
+  - (instancetype)initWithDevice: (std::shared_ptr<Indium::Device>)device
+  {
+  	self = [super init];
+-@@ -123,6 +219,7 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -123,6 +215,7 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  		_device = device;
+  		_threadExitCondition = [NSCondition new];
+  		_threadIsRunning = NO;
+@@ -1277,7 +1273,7 @@ index f58184a..2c45608 100644
+  		_pollingThread = [[NSThread alloc] initWithTarget: self selector: @selector(pollingLoop) object: nil];
+  		[_pollingThread start];
+  	}
+-@@ -133,6 +230,7 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -133,6 +226,7 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  {
+  	[_pollingThread release];
+  	[_threadExitCondition release];
+@@ -1285,7 +1281,7 @@ index f58184a..2c45608 100644
+  
+  	[super dealloc];
+  }
+-@@ -153,12 +251,60 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -153,12 +247,63 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  	[_threadExitCondition unlock];
+  }
+  
+@@ -1321,8 +1317,11 @@ index f58184a..2c45608 100644
+ +- (BOOL)isLowPower { return NO; }
+ +- (BOOL)isRemovable { return NO; }
+ +- (BOOL)isHeadless { return NO; }
+-+- (NSString*)name { return _name; }
+-+- (uint64_t)registryID { return MTLDeviceInfo::kDefaultRegistryID; }
+++- (NSString*)name
+++{
+++	return _name != nil ? _name : @"AMD Radeon Pro 5500M";
+++}
+++- (uint64_t)registryID { return 0x100000439ULL; }
+ +- (BOOL)supportsFamily: (NSUInteger)family { return YES; }
+ +- (BOOL)supportsFeatureSet: (NSUInteger)featureSet { return YES; }
+ +- (BOOL)supportsTextureSampleCount: (NSUInteger)sampleCount { return sampleCount <= 4; }
+@@ -1347,7 +1346,7 @@ index f58184a..2c45608 100644
+  	if (!pso) {
+  		if (error) {
+  			// TODO: better error and/or match what the official Metal method does
+-@@ -166,6 +312,7 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -166,6 +311,7 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  		}
+  		return nil;
+  	}
+@@ -1355,7 +1354,7 @@ index f58184a..2c45608 100644
+  	return [[MTLComputePipelineStateInternal alloc] initWithState: pso device: self label: descriptor.label];
+  }
+  
+-@@ -183,7 +330,13 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -183,7 +329,13 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+                                                          reflection: (MTLAutoreleasedComputePipelineReflection*)reflection 
+                                                               error: (NSError**)error
+  {
+@@ -1370,7 +1369,7 @@ index f58184a..2c45608 100644
+  	if (!pso) {
+  		if (error) {
+  			// TODO: better error and/or match what the official Metal method does
+-@@ -191,13 +344,44 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -191,13 +343,44 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  		}
+  		return nil;
+  	}
+@@ -1416,7 +1415,7 @@ index f58184a..2c45608 100644
+  	if (!pso) {
+  		if (error) {
+  			// TODO: better error and/or match what the official Metal method does
+-@@ -205,7 +389,118 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -205,7 +388,118 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  		}
+  		return nil;
+  	}
+@@ -1536,7 +1535,7 @@ index f58184a..2c45608 100644
+  }
+  
+  - (id<MTLCommandQueue>)newCommandQueue
+-@@ -275,8 +570,21 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -275,8 +569,21 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  - (id<MTLLibrary>)newLibraryWithData: (dispatch_data_t)data
+                                 error: (NSError**)error
+  {
+@@ -3486,9 +3485,10 @@ new file mode 100644
+ +#endif
+ diff --git a/private-include/Metal/MTLDeviceInfo.h b/private-include/Metal/MTLDeviceInfo.h
+ new file mode 100644
++index 0000000..e8a95bb
+ --- /dev/null
+ +++ b/private-include/Metal/MTLDeviceInfo.h
+-@@ -0,0 +1,166 @@
++@@ -0,0 +1,200 @@
+ +// SPDX-FileCopyrightText: 2026 Darling Developers
+ +// SPDX-License-Identifier: MPL-2.0
+ +
+@@ -3506,9 +3506,9 @@ new file mode 100644
+ +namespace MTLDeviceInfo {
+ +
+ +// Used when neither the cleaned nor the raw Vulkan name has any characters.
+-+static constexpr const char* kFallbackName = "Darling Indium Device";
+-+// A real Mac never reports registry ID 0, and apps use it as a key for the device.
+++static constexpr const char* kFallbackName = "AMD Radeon Pro 5500M";
+ +static constexpr uint64_t kDefaultRegistryID = 0x100000439ULL;
+++static constexpr uint64_t kDefaultWorkingSetBytes = 4ull << 30; // 4 GB VRAM
+ +
+ +static inline bool isSpace(char c) {
+ +	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+@@ -3587,10 +3587,7 @@ new file mode 100644
+ +	return rawTrimmed.empty() ? std::string(kFallbackName) : rawTrimmed;
+ +}
+ +
+-+// DARLING_METAL_GPU_NAME (used verbatim when non-empty) wins over the Vulkan name.
+-+// With DARLING_METAL_MAC_GPU_NAME=1: the GPU from the host's vendor that the MacBookPro16,1
+-+// iokitd reports shipped with, by Vulkan vendor ID. nullptr for other vendors (NVIDIA), which
+-+// keep their own name so apps never take another vendor's driver paths.
+++// DARLING_METAL_MAC_GPU_NAME: MacBookPro16,1 GPUs by host vendor.
+ +static inline const char* macGpuName(uint32_t vendorID) {
+ +	switch (vendorID) {
+ +	case 0x1002: return "AMD Radeon Pro 5500M";
+@@ -3599,8 +3596,15 @@ new file mode 100644
+ +	}
+ +}
+ +
+-+// DARLING_METAL_GPU_NAME wins, then the Mac GPU name (when enabled and known), then the
+-+// cleaned Vulkan name.
+++static inline uint64_t macVramBytes(uint32_t vendorID) {
+++	switch (vendorID) {
+++	case 0x1002: return 4096ull * 1024ull * 1024ull;
+++	case 0x8086: return 1536ull * 1024ull * 1024ull;
+++	default: return 0;
+++	}
+++}
+++
+++// DARLING_METAL_GPU_NAME (used verbatim when non-empty) wins over the Vulkan name.
+ +static inline std::string resolveName(const char* overrideName, const char* vulkanName, const char* macName = nullptr) {
+ +	if (overrideName && overrideName[0] != '\0') {
+ +		return overrideName;
+@@ -3611,6 +3615,36 @@ new file mode 100644
+ +	return metalNameFromVulkanName(vulkanName);
+ +}
+ +
+++// Resolves the device name reporting for Metal anti-cheat stealth:
+++// 1. Explicit DARLING_METAL_GPU_NAME override wins if non-empty.
+++// 2. Explicit DARLING_METAL_USE_HOST_GPU=1 uses the host Vulkan device name.
+++// 3. Otherwise defaults to MacBookPro16,1 Mac GPU or kFallbackName ("AMD Radeon Pro 5500M").
+++static inline std::string resolveDeviceName(const char* overrideName, const char* vulkanName, bool useHostGpu = false, uint32_t vendorID = 0) {
+++	if (overrideName && overrideName[0] != '\0') {
+++		return overrideName;
+++	}
+++	if (useHostGpu) {
+++		return metalNameFromVulkanName(vulkanName);
+++	}
+++	const char* mac = macGpuName(vendorID);
+++	return mac ? std::string(mac) : std::string(kFallbackName);
+++}
+++
+++// Resolves the working set size (VRAM budget):
+++// 1. Explicit DARLING_METAL_VRAM_MB override wins if valid (> 0).
+++// 2. Explicit DARLING_METAL_USE_HOST_GPU=1 uses host Vulkan heap working set.
+++// 3. Otherwise defaults to Apple MacBookPro16,1 VRAM (AMD: 4096 MB, Intel: 1536 MB, default: 4 GB).
+++static inline uint64_t resolveWorkingSetBytes(uint64_t vramOverrideBytes, uint64_t hostWorkingSetBytes, bool useHostGpu = false, uint32_t vendorID = 0) {
+++	if (vramOverrideBytes != 0) {
+++		return vramOverrideBytes;
+++	}
+++	if (useHostGpu) {
+++		return hostWorkingSetBytes != 0 ? hostWorkingSetBytes : kDefaultWorkingSetBytes;
+++	}
+++	uint64_t macVram = macVramBytes(vendorID);
+++	return macVram != 0 ? macVram : kDefaultWorkingSetBytes;
+++}
+++
+ +// Parses DARLING_METAL_VRAM_MB: a positive decimal integer of mebibytes, digits only.
+ +// Returns 0 (meaning "ignore") for anything else, including overflow.
+ +static inline uint64_t parseMegabytes(const char* text) {
+diff --git a/patches/xnu.patch b/patches/xnu.patch
+index cca411d..d664e8a 100644
+--- a/patches/xnu.patch
++++ b/patches/xnu.patch
+@@ -115,6 +115,33 @@ index 207dae6..f5e96db 100644
+  #ifndef BUILDING_BASE_C
+  
+  VISIBLE
++diff --git a/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h b/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h
++new file mode 100644
++index 0000000..eb90f43
++--- /dev/null
+++++ b/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h
++@@ -0,0 +1,21 @@
+++#ifndef DARLING_CPU_FREQUENCY_H
+++#define DARLING_CPU_FREQUENCY_H
+++#include <stdint.h>
+++#include <stdbool.h>
+++
+++// Linux cpufreq exposes kHz; Darwin's hw.cpufrequency is an unsigned 64-bit Hz value.
+++static inline bool darling_frequency_hz(const char* text, uint64_t* result)
+++{
+++    uint64_t value = 0;
+++    if (!text || !result || *text < '0' || *text > '9') return false;
+++    do {
+++        unsigned digit = (unsigned)(*text++ - '0');
+++        if (value > (UINT64_MAX - digit) / 10) return false;
+++        value = value * 10 + digit;
+++    } while (*text >= '0' && *text <= '9');
+++    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') ++text;
+++    if (*text || !value || value > UINT64_MAX / 1000) return false;
+++    *result = value * 1000;
+++    return true;
+++}
+++#endif
+ diff --git a/darling/src/libsystem_kernel/emulation/include/common/cpu_topology.h b/darling/src/libsystem_kernel/emulation/include/common/cpu_topology.h
+ new file mode 100644
+ index 0000000..8ae1665
+@@ -1576,10 +1603,36 @@ index dc8fbb8..171746a 100644
+ +	__linux_sched_yield_site("SWTYLD");
+ +}
+ diff --git a/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
+-index 206e92e..1a763fe 100644
++index 206e92e..969e0f4 100644
+ --- a/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
+ +++ b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
+-@@ -151,8 +151,13 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
++@@ -32,6 +32,13 @@ extern _libkernel_functions_t _libkernel_functions;
++ void darling_sigexc_uninstall(void);
++ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext* ctxt);
++ 
+++#ifndef __NR_arch_prctl
+++#define __NR_arch_prctl 158
+++#endif
+++#ifndef ARCH_SET_CPUID
+++#define ARCH_SET_CPUID 0x1012
+++#endif
+++
++ #define SIGEXC_STACK_SIZE (48ULL * 1024ULL)
++ 
++ #ifndef SIGALTSTACK_GUARD
++@@ -118,6 +125,11 @@ void sigexc_setup(void)
++ 	sigexc_setup1();
++ 	sigexc_setup2();
++ 
+++#if defined(__x86_64__)
+++	/* darling-lol: enable userspace CPUID faulting for Coffee Lake Intel Core i9 virtualization */
+++	LINUX_SYSCALL(__NR_arch_prctl, ARCH_SET_CPUID, 0);
+++#endif
+++
++ #ifdef VARIANT_DYLD
++ 	bool started_suspended;
++ 	int code = dserver_rpc_started_suspended(&started_suspended);
++@@ -151,8 +163,13 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
+  	int status = dserver_rpc_interrupt_enter();
+  
+  	if (status != 0) {
+@@ -1595,7 +1648,7 @@ index 206e92e..1a763fe 100644
+  	}
+  
+  	if (signum == SIGNAL_SIGEXC_SUSPEND) {
+-@@ -267,13 +272,165 @@ static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, c
++@@ -267,13 +284,319 @@ static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, c
+  #endif
+  }
+  
+@@ -1603,6 +1656,145 @@ index 206e92e..1a763fe 100644
+ +static int _lol_depth = 0;
+ +
+ +#ifdef __x86_64__
+++struct lol_iovec { void *base; unsigned long size; };
+++
+++static void _lol_emulate_cpuid(struct linux_ucontext* ctxt)
+++{
+++	uint32_t leaf = (uint32_t) ctxt->uc_mcontext.gregs.rax;
+++	uint32_t subleaf = (uint32_t) ctxt->uc_mcontext.gregs.rcx;
+++	uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+++
+++	switch (leaf) {
+++	case 0:
+++		eax = 22; /* max basic leaf */
+++		ebx = 0x756e6547; /* "Genu" */
+++		edx = 0x49656e69; /* "ineI" */
+++		ecx = 0x6c65746e; /* "ntel" */
+++		break;
+++	case 1:
+++		eax = 0x000906ED; /* Family 6, Model 158, Stepping 13 (Coffee Lake Refresh) */
+++		ebx = 0x00100800; /* 16 logical processors, 64-byte CLFLUSH */
+++		ecx = 0x7ffafbbf; /* Hypervisor bit 31 = 0 (bare-metal) */
+++		edx = 0xbfebfbff; /* Standard features */
+++		break;
+++	case 2:
+++		eax = 0x76036301;
+++		ebx = 0x00f0b5ff;
+++		ecx = 0x00000000;
+++		edx = 0x00c10000;
+++		break;
+++	case 3:
+++		eax = 0; ebx = 0; ecx = 0; edx = 0;
+++		break;
+++	case 4:
+++		if (subleaf == 0) { /* L1 Data Cache: 32 KB, 8-way, 64B lines */
+++			eax = 0x1c004121; ebx = 0x01c0003f; ecx = 0x0000003f; edx = 0;
+++		} else if (subleaf == 1) { /* L1 Instruction Cache: 32 KB, 8-way, 64B lines */
+++			eax = 0x1c004122; ebx = 0x01c0003f; ecx = 0x0000003f; edx = 0;
+++		} else if (subleaf == 2) { /* L2 Cache: 256 KB, 4-way, 64B lines */
+++			eax = 0x1c004143; ebx = 0x00c0003f; ecx = 0x000003ff; edx = 0;
+++		} else if (subleaf == 3) { /* L3 Cache: 16 MB, 16-way, 64B lines */
+++			eax = 0x1c03c163; ebx = 0x03c0003f; ecx = 0x00003fff; edx = 0x00000002;
+++		} else {
+++			eax = 0; ebx = 0; ecx = 0; edx = 0;
+++		}
+++		break;
+++	case 5:
+++		eax = 0x00000040; ebx = 0x00000040; ecx = 0x00000003; edx = 0x00021120;
+++		break;
+++	case 6:
+++		eax = 0x00000077; ebx = 0x00000002; ecx = 0x00000009; edx = 0;
+++		break;
+++	case 7:
+++		if (subleaf == 0) {
+++			eax = 0;
+++			ebx = 0x029c67af; /* FSGSBASE, BMI1, AVX2, SMEP, BMI2, ERMS, INVPCID, RDSEED, ADX, SMAP */
+++			ecx = 0;
+++			edx = 0x9c002400;
+++		} else {
+++			eax = 0; ebx = 0; ecx = 0; edx = 0;
+++		}
+++		break;
+++	case 0x0A:
+++		eax = 0x07300404; ebx = 0; ecx = 0; edx = 0x00000603;
+++		break;
+++	case 0x0B:
+++		if (subleaf == 0) {
+++			eax = 1; ebx = 2; ecx = 0x0100; edx = (uint32_t) ctxt->uc_mcontext.gregs.rdx;
+++		} else if (subleaf == 1) {
+++			eax = 4; ebx = 16; ecx = 0x0201; edx = (uint32_t) ctxt->uc_mcontext.gregs.rdx;
+++		} else {
+++			eax = 0; ebx = 0; ecx = (subleaf << 8); edx = (uint32_t) ctxt->uc_mcontext.gregs.rdx;
+++		}
+++		break;
+++	case 0x0D:
+++		if (subleaf == 0) {
+++			eax = 0x0000001f; ebx = 0x00000440; ecx = 0x00000440; edx = 0;
+++		} else if (subleaf == 1) {
+++			eax = 0x0000000f; ebx = 0x000003c0; ecx = 0; edx = 0;
+++		} else {
+++			eax = 0; ebx = 0; ecx = 0; edx = 0;
+++		}
+++		break;
+++	case 0x15:
+++		eax = 2; ebx = 200; ecx = 24000000; edx = 0;
+++		break;
+++	case 0x16:
+++		eax = 2400; /* Base frequency 2400 MHz */
+++		ebx = 5000; /* Max frequency 5000 MHz */
+++		ecx = 100;  /* Bus frequency 100 MHz */
+++		edx = 0;
+++		break;
+++	case 0x80000000:
+++		eax = 0x80000008; /* Max extended leaf */
+++		ebx = 0; ecx = 0; edx = 0;
+++		break;
+++	case 0x80000001:
+++		eax = 0x000906ED;
+++		ebx = 0;
+++		ecx = 0x00000121;
+++		edx = 0x2c100800;
+++		break;
+++	case 0x80000002: {
+++		/* "Intel(R) Core(TM) " */
+++		static const uint32_t b0[4] = { 0x65746e49, 0x2952286c, 0x726f4320, 0x4d542865 };
+++		eax = b0[0]; ebx = b0[1]; ecx = b0[2]; edx = b0[3];
+++		break;
+++	}
+++	case 0x80000003: {
+++		/* ") i9-9980HK CPU @" */
+++		static const uint32_t b1[4] = { 0x39692029, 0x3839392d, 0x204b4830, 0x20555043 };
+++		eax = b1[0]; ebx = b1[1]; ecx = b1[2]; edx = b1[3];
+++		break;
+++	}
+++	case 0x80000004: {
+++		/* " 2.40GHz\0\0\0\0\0\0\0" */
+++		static const uint32_t b2[4] = { 0x2e322040, 0x48473034, 0x0000007a, 0x00000000 };
+++		eax = b2[0]; ebx = b2[1]; ecx = b2[2]; edx = b2[3];
+++		break;
+++	}
+++	case 0x80000006:
+++		eax = 0; ebx = 0; ecx = 0x01006040; edx = 0;
+++		break;
+++	case 0x80000007:
+++		eax = 0; ebx = 0; ecx = 0;
+++		edx = 0x00000100; /* Invariant TSC (bit 8 = 1) */
+++		break;
+++	case 0x80000008:
+++		eax = 0x00003027; /* 39-bit physical / 48-bit virtual */
+++		ebx = 0; ecx = 0; edx = 0;
+++		break;
+++	default:
+++		eax = 0; ebx = 0; ecx = 0; edx = 0;
+++		break;
+++	}
+++
+++	ctxt->uc_mcontext.gregs.rax = (unsigned long long) eax;
+++	ctxt->uc_mcontext.gregs.rbx = (unsigned long long) ebx;
+++	ctxt->uc_mcontext.gregs.rcx = (unsigned long long) ecx;
+++	ctxt->uc_mcontext.gregs.rdx = (unsigned long long) edx;
+++}
+++
+ +/* The crashing process's stdout is often not a log its owner can read (the League game's is not),
+ + * so the same report is also appended to the host's /tmp/lolsig.log with the module map needed to
+ + * resolve the addresses. Only return addresses and the map are written, never data. */
+@@ -1649,7 +1841,6 @@ index 206e92e..1a763fe 100644
+ +
+ +    /* Kernel-mediated copies fail safely for inaccessible stacks. Print only
+ +     * return addresses, never stack contents, strings, or argument values. */
+-+    struct lol_iovec { void *base; unsigned long size; };
+ +    unsigned long long frame = ctxt->uc_mcontext.gregs.rbp;
+ +    for (unsigned i = 0; i < 40 && frame; ++i) {
+ +        unsigned long long pair[2];
+@@ -1688,6 +1879,22 @@ index 206e92e..1a763fe 100644
+ +
+  void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_ucontext* ctxt)
+  {
+++#if defined(__x86_64__)
+++	/* darling-lol: userspace CPUID fault interception & virtualization */
+++	if (linux_signum == LINUX_SIGSEGV && ctxt != NULL) {
+++		unsigned char insn[2] = {0, 0};
+++		struct lol_iovec local = { insn, sizeof(insn) };
+++		struct lol_iovec remote = { (void*) ctxt->uc_mcontext.gregs.rip, sizeof(insn) };
+++		long self = LINUX_SYSCALL(__NR_getpid);
+++		long copied = linux_syscall(self, &local, 1, &remote, 1, 0, __NR_process_vm_readv);
+++		if (copied == 2 && insn[0] == 0x0f && insn[1] == 0xa2) {
+++			_lol_emulate_cpuid(ctxt);
+++			ctxt->uc_mcontext.gregs.rip += 2;
+++			return;
+++		}
+++	}
+++#endif
+++
+  	int status = dserver_rpc_interrupt_enter();
+ +	if (forward_native_resize_signal(linux_signum, status))
+ +		return;
+@@ -1762,7 +1969,7 @@ index 206e92e..1a763fe 100644
+  	}
+  
+  	kern_printf("sigexc_handler(%d, %p, %p)\n", linux_signum, info, ctxt);
+-@@ -359,7 +516,13 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
++@@ -359,7 +682,13 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
+  						sizeof(sa.sa_mask));
+  
+  				// Resend signal to self
+@@ -1866,7 +2073,7 @@ index 7d5ef80..46debb8 100644
+  	[521] = sys_abort_with_payload,
+  	[524] = sys_setattrlistat,
+ diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
+-index f273989..058b985 100644
++index f273989..4f73686 100644
+ --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
+ +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
+ @@ -9,6 +9,8 @@
+@@ -1886,7 +2093,7 @@ index f273989..058b985 100644
+  	_HW_PHYSICAL_CPU = 1000,
+  	_HW_PHYSICAL_CPU_MAX,
+  	_HW_LOGICAL_CPU,
+-@@ -24,10 +27,14 @@ enum {
++@@ -24,10 +27,16 @@ enum {
+  	_HW_CPUSUBTYPE,
+  	_HW_CPUTHREADTYPE,
+  	_HW_64BITCAPABLE,
+@@ -1895,6 +2102,8 @@ index f273989..058b985 100644
+ +	_HW_CPUFREQUENCY = 1500,
+ +	_HW_CACHECONFIG = 1200,
+ +	_HW_CACHESIZE,
+++	_HW_PRODUCT = 27,
+++	_HW_TARGETTYPE = 1300,
+  };
+  
+  static sysctl_handler(handle_availcpu);
+@@ -1902,11 +2111,13 @@ index f273989..058b985 100644
+  static sysctl_handler(handle_physicalcpu);
+  static sysctl_handler(handle_physicalcpu_max);
+  static sysctl_handler(handle_logicalcpu);
+-@@ -39,11 +46,78 @@ static sysctl_handler(handle_cpusubtype);
++@@ -39,11 +48,80 @@ static sysctl_handler(handle_cpusubtype);
+  static sysctl_handler(handle_cputhreadtype);
+  static sysctl_handler(handle_cpu64bitcapable);
+  static sysctl_handler(handle_machine);
+ +static sysctl_handler(handle_model);
+++static sysctl_handler(handle_product);
+++static sysctl_handler(handle_targettype);
+  static sysctl_handler(handle_cpufrequency);
+ +static sysctl_handler(handle_cpufrequency_compat);
+ +static sysctl_handler(handle_cacheconfig);
+@@ -1982,13 +2193,15 @@ index f273989..058b985 100644
+  	{ .oid = _HW_PHYSICAL_CPU, .type = CTLTYPE_INT, .exttype = "", .name = "physicalcpu", .handler = handle_physicalcpu },
+  	{ .oid = _HW_PHYSICAL_CPU_MAX, .type = CTLTYPE_INT, .exttype = "", .name = "physicalcpu_max", .handler = handle_physicalcpu_max },
+  	{ .oid = _HW_LOGICAL_CPU, .type = CTLTYPE_INT, .exttype = "", .name = "logicalcpu", .handler = handle_logicalcpu },
+-@@ -55,7 +129,12 @@ const struct known_sysctl sysctls_hw[] = {
++@@ -55,7 +133,14 @@ const struct known_sysctl sysctls_hw[] = {
+  	{ .oid = _HW_CPUTHREADTYPE, .type = CTLTYPE_INT, .exttype = "", .name = "cputhreadtype", .handler = handle_cputhreadtype },
+  	{ .oid = _HW_64BITCAPABLE, .type = CTLTYPE_INT, .exttype = "", .name = "cpu64bit_capable", .handler = handle_cpu64bitcapable },
+  	{ .oid = HW_MACHINE, .type = CTLTYPE_STRING, .exttype = "S", .name = "machine", .handler = handle_machine },
+ -	{ .oid = _HW_CPUFREQUENCY, .type = CTLTYPE_INT, .exttype = "", .name = "cpufrequency", .handler = handle_cpufrequency },
+ +	{ .oid = _HW_OPTIONAL, .type = CTLTYPE_NODE, .exttype = "", .name = "optional", .subctls = sysctls_hw_optional },
+ +	{ .oid = HW_MODEL, .type = CTLTYPE_STRING, .exttype = "S", .name = "model", .handler = handle_model },
+++	{ .oid = _HW_PRODUCT, .type = CTLTYPE_STRING, .exttype = "S", .name = "product", .handler = handle_product },
+++	{ .oid = _HW_TARGETTYPE, .type = CTLTYPE_STRING, .exttype = "S", .name = "targettype", .handler = handle_targettype },
+ +	{ .oid = _HW_CPUFREQUENCY, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "cpufrequency", .handler = handle_cpufrequency },
+ +	{ .oid = _HW_CPUFREQUENCY_COMPAT, .type = CTLTYPE_INT, .exttype = "I", .name = "cpufrequency_compat", .handler = handle_cpufrequency_compat },
+ +	{ .oid = _HW_CACHECONFIG, .type = CTLTYPE_OPAQUE, .exttype = "Q", .name = "cacheconfig", .handler = handle_cacheconfig },
+@@ -1996,7 +2209,7 @@ index f273989..058b985 100644
+  	{ .oid = -1 }
+  };
+  
+-@@ -71,6 +150,32 @@ static const struct host_basic_info* gethostinfo(void)
++@@ -71,6 +156,32 @@ static const struct host_basic_info* gethostinfo(void)
+  		hself = mach_host_self();
+  		host_info(hself, HOST_BASIC_INFO, &hinfo, &hcount);
+  		mach_port_deallocate(mach_task_self(), hself);
+@@ -2029,7 +2242,7 @@ index f273989..058b985 100644
+  	}
+  
+  	return &hinfo;
+-@@ -83,6 +188,13 @@ sysctl_handler(handle_availcpu)
++@@ -83,6 +194,13 @@ sysctl_handler(handle_availcpu)
+  	return 0;
+  }
+  
+@@ -2043,7 +2256,7 @@ index f273989..058b985 100644
+  sysctl_handler(handle_physicalcpu)
+  {
+  	sysctl_handle_size(sizeof(int));
+-@@ -169,16 +281,49 @@ sysctl_handler(handle_cputhreadtype)
++@@ -169,16 +287,49 @@ sysctl_handler(handle_cputhreadtype)
+  	return 0;
+  }
+  
+@@ -2100,7 +2313,7 @@ index f273989..058b985 100644
+  }
+  
+  sysctl_handler(handle_cpu64bitcapable)
+-@@ -193,3 +338,104 @@ sysctl_handler(handle_machine)
++@@ -193,3 +344,116 @@ sysctl_handler(handle_machine)
+  	copyout_string(need_uname()->machine, (char*) old, oldlen);
+  	return 0;
+  }
+@@ -2112,6 +2325,18 @@ index f273989..058b985 100644
+ +	return 0;
+ +}
+ +
+++sysctl_handler(handle_product)
+++{
+++	copyout_string("MacBookPro16,1", (char*) old, oldlen);
+++	return 0;
+++}
+++
+++sysctl_handler(handle_targettype)
+++{
+++	copyout_string("Mac", (char*) old, oldlen);
+++	return 0;
+++}
+++
+ +#define CACHE_LEVELS 10
+ +// The guest has no /sys of its own; the host's is reachable through the SystemRoot volume
+ +#define HOST_CACHE_DIR "/Volumes/SystemRoot/sys/devices/system/cpu/cpu0/cache/"
+@@ -2206,10 +2431,63 @@ index f273989..058b985 100644
+ +	return 0;
+ +}
+ diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c
+-index bd9cdc2..83ad15c 100644
++index bd9cdc2..89c1468 100644
+ --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c
+ +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c
+-@@ -139,18 +139,23 @@ sysctl_handler(handle_boottime)
++@@ -23,6 +23,9 @@
++ enum {
++ 	_KERN_MSGBUF = 1000,
++ 	_KERN_OSPRODUCTVERSION,
+++	_KERN_HV_VMM_PRESENT,
+++	_KERN_BOOTARGS,
+++	_KERN_SECURE_KERNEL,
++ 
++ 	_KERN_SEMMNS = 1000,
++ };
++@@ -46,6 +49,9 @@ static sysctl_handler(handle_usrstack64);
++ static sysctl_handler(handle_sysv_semmns);
++ static sysctl_handler(handle_osproductversion);
++ static sysctl_handler(handle_osrevision);
+++static sysctl_handler(handle_hv_vmm_present);
+++static sysctl_handler(handle_bootargs);
+++static sysctl_handler(handle_secure_kernel);
++ 
++ extern int _sysctl_proc(int what, int flag, struct kinfo_proc* out, unsigned long* buflen);
++ extern int _sysctl_procargs(int pid, char* buf, unsigned long* buflen);
++@@ -76,6 +82,9 @@ const struct known_sysctl sysctls_kern[] = {
++ 	{ .oid = KERN_USRSTACK64, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "usrstack64", .handler = handle_usrstack64 },
++ 	{ .oid = _KERN_OSPRODUCTVERSION, .type = CTLTYPE_STRING, .exttype = "S", .name = "osproductversion", .handler = handle_osproductversion },
++ 	{ .oid = KERN_OSREV, .type = CTLTYPE_INT, .exttype = "I", .name = "osrevision", .handler = handle_osrevision },
+++	{ .oid = _KERN_HV_VMM_PRESENT, .type = CTLTYPE_INT, .exttype = "I", .name = "hv_vmm_present", .handler = handle_hv_vmm_present },
+++	{ .oid = _KERN_BOOTARGS, .type = CTLTYPE_STRING, .exttype = "S", .name = "bootargs", .handler = handle_bootargs },
+++	{ .oid = _KERN_SECURE_KERNEL, .type = CTLTYPE_INT, .exttype = "I", .name = "secure_kernel", .handler = handle_secure_kernel },
++ 	{ .oid = KERN_SYSV, .type = CTLTYPE_NODE, .exttype = "", .name = "sysv", .subctls = sysctls_kern_sysv },
++ 	{ .oid = -1 }
++ };
++@@ -88,18 +97,14 @@ sysctl_handler(handle_msgbuf)
++ 		if (*oldlen < sizeof(int))
++ 			return -EINVAL;
++ 
++-		*((int*) old) = __linux_syslog(SYSLOG_ACTION_SIZE_BUFFER, NULL, 0);
+++		*((int*) old) = 0;
++ 	}
++ 	else
++ 	{
++ 		// Caller is asking for buffer contents
++-		int ret;
++-
++-		ret = __linux_syslog(SYSLOG_ACTION_READ_ALL, (char*) old, *oldlen);
++-		if (ret < 0)
++-			return errno_linux_to_bsd(ret);
++-
++-		*oldlen = ret;
+++		if (old != NULL && *oldlen > 0)
+++			((char*) old)[0] = '\0';
+++		*oldlen = 0;
++ 	}
++ 	return 0;
++ }
++@@ -139,18 +144,23 @@ sysctl_handler(handle_boottime)
+  	// Fill in struct timeval { tv_sec, tv_usec }
+  	struct sysinfo info;
+  	struct bsd_timeval* tv;
+@@ -2239,8 +2517,32 @@ index bd9cdc2..83ad15c 100644
+  
+  		// we don't want the microseconds to be constantly jumping around
+  		// (that actually causes an infinite loop in `_mach_boottime_usec` in libc)
++@@ -342,3 +352,23 @@ static sysctl_handler(handle_osrevision) {
++ 	*oldlen = sizeof(*ovalue);
++ 	return 0;
++ }
+++
+++sysctl_handler(handle_hv_vmm_present)
+++{
+++	sysctl_handle_size(sizeof(int));
+++	*((int*) old) = 0;
+++	return 0;
+++}
+++
+++sysctl_handler(handle_bootargs)
+++{
+++	copyout_string("", (char*) old, oldlen);
+++	return 0;
+++}
+++
+++sysctl_handler(handle_secure_kernel)
+++{
+++	sysctl_handle_size(sizeof(int));
+++	*((int*) old) = 0;
+++	return 0;
+++}
+ diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
+-index 4319355..122ad3a 100644
++index 4319355..e52fae0 100644
+ --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
+ +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
+ @@ -4,6 +4,7 @@
+@@ -2289,8 +2591,104 @@ index 4319355..122ad3a 100644
+  	{ .oid = -1 }
+  };
+  
+-@@ -154,38 +163,37 @@ sysctl_handler(handle_stepping)
+-     return 0;
++@@ -70,122 +79,71 @@ const struct known_sysctl sysctls_machdep[] = {
++ #endif
++ 
++ 
++-static inline void copyout_int(int value, char* to_copy, size_t* to_copy_length)
++-{
++-        char tmp[64];
++-        __simple_sprintf(tmp, "%d", value);
++-        copyout_string(tmp, to_copy, to_copy_length);
++-}
++-
++-
++ sysctl_handler(handle_vendor)
++ {
++-	unsigned int level = 0;
++-    unsigned int eax = 0;
++-	union
++-	{
++-		struct
++-		{
++-	    	unsigned int ebx;
++-		    unsigned int edx;
++-	    	unsigned int ecx;
++-		};
++-		char name[13];
++-	} v;
++-
++-    __cpuid(level, eax, v.ebx, v.ecx, v.edx);
++-
++-	v.name[12] = 0;
++-	copyout_string(v.name, (char*) old, oldlen);
++-
+++	copyout_string("GenuineIntel", (char*) old, oldlen);
++ 	return 0;
++ }
++ 
++ sysctl_handler(handle_max_basic)
++ {
++-	setup(0);
++-
++-
++-    __cpuid(level, eax, ebx, ecx, edx);
++-
++-	copyout_int(eax, (char*)old,oldlen);
++-
+++	sysctl_handle_size(sizeof(int));
+++	*((int*) old) = 22;
++ 	return 0;
++ }
++ 
++ sysctl_handler(handle_family)
++ {
++-    setup(1);
++-
++-    __cpuid(level, eax, ebx, ecx, edx);
++-
++-    eax = eax >> 7;
++-    eax &= 15;
++-
++-    copyout_int(eax, old, oldlen);
++-
++-    return 0;
+++	sysctl_handle_size(sizeof(int));
+++	*((int*) old) = 6;
+++	return 0;
++ }
++ 
++ sysctl_handler(handle_model)
++ {
++-    setup(1);
++-
++-    __cpuid(level, eax, ebx, ecx, edx);
++-
++-    eax = eax >> 3;
++-    eax &= 15;
++-
++-    copyout_int(eax,(char*)old, oldlen);
++-
++-    return 0;
+++	sysctl_handle_size(sizeof(int));
+++	*((int*) old) = 158;
+++	return 0;
++ }
++ 
++ sysctl_handler(handle_stepping)
++ {
++-    setup(1);
++-
++-    __cpuid(level, eax, ebx, ecx, edx);
++-
++-    eax &= 15;
++-
++-    copyout_int(eax,(char*)old, oldlen);
++-
++-    return 0;
+++	sysctl_handle_size(sizeof(int));
+++	*((int*) old) = 13;
+++	return 0;
+  }
+  
+ +// Original cpuid-based implementation, replaced by the fixed brand string defined above
+@@ -2303,7 +2701,6 @@ index 4319355..122ad3a 100644
+ -
+ -    if (eax < 0x80000004) // the information is not implemented
+ -        return 2;
+--
+ +	union
+ +	{
+ +		unsigned int brand[12];
+@@ -2313,14 +2710,15 @@ index 4319355..122ad3a 100644
+  
+ +	__asm__("cpuid" : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx) : "0" (0x80000000u), "2" (0));
+  
+++	if (eax < 0x80000004) // the information is not implemented
+++		return -ENOENT;
++ 
+ -    union
+ -    {
+ -        unsigned int brand[12];
+ -        char name[49];
+ -    } v;
+-+	if (eax < 0x80000004) // the information is not implemented
+-+		return -ENOENT;
+- 
++-
+ -		for (int i = 1; i < 4; i++)
+ -		{
+ -				eax = 0x80000000+i;
+@@ -2351,7 +2749,7 @@ index 4319355..122ad3a 100644
+  
+  sysctl_handler(handle_features)
+  {
+-@@ -269,45 +277,54 @@ sysctl_handler(handle_features)
++@@ -269,45 +227,54 @@ sysctl_handler(handle_features)
+  // TODO: i doubt core count is ever going to change.
+  //       this is something that could be cached if we had some way of doing something only once in libsystem_kernel (i.e. a simple version of dispatch_once).
+  sysctl_handler(handle_core_count) {
+@@ -2391,51 +2789,51 @@ index 4319355..122ad3a 100644
+ -			continue;
+ -		}
+ +		_readline_init(&rbuf);
+- 
+--		// great, we've got "cpu cores"
+--		// now find the actual number
+--		while (*line != ':' && *line != '\0')
+--			++line;
+++
+ +		while ((line = _readline(infofd, &rbuf)) != NULL) {
+ +			if (strncmp(line, "cpu cores", 9) != 0) {
+ +				continue;
+ +			}
+  
+--		// shouldn't happen, but just in case
+--		if (*line == '\0')
+--			continue;
++-		// great, we've got "cpu cores"
++-		// now find the actual number
++-		while (*line != ':' && *line != '\0')
++-			++line;
+ +			// great, we've got "cpu cores"
+ +			// now find the actual number
+ +			while (*line != ':' && *line != '\0')
+ +				++line;
+  
+--		++line; // skip the colon
++-		// shouldn't happen, but just in case
+ -		if (*line == '\0')
+ -			continue;
+ +			// shouldn't happen, but just in case
+ +			if (*line == '\0')
+ +				continue;
+  
+--		++line; // skip the space
++-		++line; // skip the colon
+ -		if (*line == '\0')
+ -			continue;
+ +			++line; // skip the colon
+ +			if (*line == '\0')
+ +				continue;
+  
+--		core_count = __simple_atoi(line, NULL);
+--		break;
++-		++line; // skip the space
++-		if (*line == '\0')
++-			continue;
+ +			++line; // skip the space
+ +			if (*line == '\0')
+ +				continue;
+-+
++ 
++-		core_count = __simple_atoi(line, NULL);
++-		break;
+ +			core_count = __simple_atoi(line, NULL);
+ +			break;
+ +		}
+  	}
+  
+  out:
+-@@ -319,3 +336,21 @@ out:
++@@ -319,3 +286,21 @@ out:
+  		*oldlen = sizeof(uint32_t);
+  	return 0;
+  }
+@@ -4798,7 +5196,7 @@ index f4740ec..bc88090 100644
+  	return ret;
+  }
+ diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/xattr/removexattr.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/xattr/removexattr.c
+-index 628a4f7..705b845 100644
++index 628a4f7..11cddf2 100644
+ --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/xattr/removexattr.c
+ +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/xattr/removexattr.c
+ @@ -2,6 +2,9 @@
+@@ -4842,7 +5240,7 @@ index 628a4f7..705b845 100644
+  	return ret;
+  }
+ diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/xattr/setxattr.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/xattr/setxattr.c
+-index c1b2d50..4e19963 100644
++index c1b2d50..8c75b15 100644
+ --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/xattr/setxattr.c
+ +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/xattr/setxattr.c
+ @@ -2,8 +2,13 @@
+@@ -4903,7 +5301,7 @@ index c1b2d50..4e19963 100644
+  	return ret;
+  }
+ diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/mach/impl/mach_traps.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/mach/impl/mach_traps.c
+-index b998456..c6281e6 100644
++index b998456..2b8b095 100644
+ --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/mach/impl/mach_traps.c
+ +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/mach/impl/mach_traps.c
+ @@ -12,9 +12,28 @@
+@@ -5863,7 +6261,7 @@ index b998456..c6281e6 100644
+  	}
+  
+  	return code;
+-@@ -152,14 +1016,33 @@ kern_return_t semaphore_wait_signal_trap_impl(
++@@ -152,14 +1022,33 @@ kern_return_t semaphore_wait_signal_trap_impl(
+  				mach_port_name_t wait_name,
+  				mach_port_name_t signal_name)
+  {
+@@ -5898,7 +6296,7 @@ index b998456..c6281e6 100644
+  	}
+  
+  	return code;
+-@@ -170,14 +1053,24 @@ kern_return_t semaphore_timedwait_trap_impl(
++@@ -170,14 +1059,24 @@ kern_return_t semaphore_timedwait_trap_impl(
+  				unsigned int sec,
+  				clock_res_t nsec)
+  {
+@@ -5924,7 +6322,7 @@ index b998456..c6281e6 100644
+  	}
+  
+  	return code;
+-@@ -189,14 +1082,32 @@ kern_return_t semaphore_timedwait_signal_trap_impl(
++@@ -189,14 +1088,32 @@ kern_return_t semaphore_timedwait_signal_trap_impl(
+  				unsigned int sec,
+  				clock_res_t nsec)
+  {
+@@ -5958,7 +6356,7 @@ index b998456..c6281e6 100644
+  	}
+  
+  	return code;
+-@@ -514,6 +1425,12 @@ kern_return_t _kernelrpc_mach_port_construct_trap_impl(
++@@ -514,6 +1431,12 @@ kern_return_t _kernelrpc_mach_port_construct_trap_impl(
+  		__simple_printf("mach_port_construct failed (internally): %d\n", code);
+  		__simple_abort();
+  	}
+@@ -5971,7 +6369,7 @@ index b998456..c6281e6 100644
+  
+  	return code;
+  }
+-@@ -673,16 +1590,16 @@ kern_return_t macx_backing_store_recovery_impl(
++@@ -673,16 +1596,16 @@ kern_return_t macx_backing_store_recovery_impl(
+  	return KERN_FAILURE;
+  }
+  
+@@ -5991,7 +6389,7 @@ index b998456..c6281e6 100644
+  	return 0;
+  }
+  
+-@@ -692,12 +1609,53 @@ kern_return_t syscall_thread_switch_impl(
++@@ -692,12 +1615,53 @@ kern_return_t syscall_thread_switch_impl(
+  				int option,
+  				mach_msg_timeout_t option_time)
+  {
+@@ -6159,30 +6557,3 @@ index 0000000..f185f6c
+ +__sysctlbyname:
+ +    /* Just jump to the syscall stub */
+ +    jmp ___sysctlbyname
+-diff --git a/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h b/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h
+-new file mode 100644
+-index 0000000..eb90f43
+---- /dev/null
+-+++ b/darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h
+-@@ -0,0 +1,21 @@
+-+#ifndef DARLING_CPU_FREQUENCY_H
+-+#define DARLING_CPU_FREQUENCY_H
+-+#include <stdint.h>
+-+#include <stdbool.h>
+-+
+-+// Linux cpufreq exposes kHz; Darwin's hw.cpufrequency is an unsigned 64-bit Hz value.
+-+static inline bool darling_frequency_hz(const char* text, uint64_t* result)
+-+{
+-+    uint64_t value = 0;
+-+    if (!text || !result || *text < '0' || *text > '9') return false;
+-+    do {
+-+        unsigned digit = (unsigned)(*text++ - '0');
+-+        if (value > (UINT64_MAX - digit) / 10) return false;
+-+        value = value * 10 + digit;
+-+    } while (*text >= '0' && *text <= '9');
+-+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') ++text;
+-+    if (*text || !value || value > UINT64_MAX / 1000) return false;
+-+    *result = value * 1000;
+-+    return true;
+-+}
+-+#endif
+diff --git a/scripts/launch-fork.sh b/scripts/launch-fork.sh
+index bbfba8e..a4cda9d 100755
+--- a/scripts/launch-fork.sh
++++ b/scripts/launch-fork.sh
+@@ -11,6 +11,9 @@ FORK_BRANCH="${FORK_BRANCH:-feat/pr41-followups}"
+ LOG_FILE="${LEAGUE_LOG:-/tmp/darling-lol-launch-fork.log}"
+ export DISPLAY="${DISPLAY:-:0}"
+ export RCLOL_FILTER_HOST_ENV="${RCLOL_FILTER_HOST_ENV:-1}"
++export DARLING_METAL_GPU_NAME="${DARLING_METAL_GPU_NAME:-AMD Radeon Pro 5500M}"
++export DARLING_METAL_MAC_GPU_NAME="${DARLING_METAL_MAC_GPU_NAME:-1}"
++export DARLING_METAL_VRAM_MB="${DARLING_METAL_VRAM_MB:-4096}"
+ 
+ log() {
+   local msg="$1"
+@@ -102,7 +105,7 @@ fi
+ 
+ # 4. Prevent disrupting an active match
+ LEAGUE_GAME_PATTERN='LeagueofLegends\.app/Contents/MacOS/LeagueofLegends( |$)'
+-if pgrep -f "$LEAGUE_GAME_PATTERN" >/dev/null 2>&1; then
++if pgrep -i -f "$LEAGUE_GAME_PATTERN" >/dev/null 2>&1; then
+   log "Active League match already running; focusing window."
+   if command -v xdotool >/dev/null 2>&1; then
+     win="$(xdotool search --onlyvisible --class 'LeagueofLegends' 2>/dev/null | head -n 1 || true)"
+@@ -183,13 +186,14 @@ else
+   # Background focus watcher on desktop mode
+   if [[ -z "${GAMESCOPE_WAYLAND_DISPLAY:-}" ]] && command -v xdotool >/dev/null 2>&1; then
+     (
++      main_pid=$$
+       i=0
+-      while [ $i -lt 60 ] && ! pgrep -f '/Riot Client\.app/|/League of Legends\.app/|RiotClientServices' >/dev/null 2>&1; do
++      while [ $i -lt 60 ] && kill -0 "$main_pid" 2>/dev/null && ! pgrep -f '/Riot Client\.app/|/League of Legends\.app/|RiotClientServices' >/dev/null 2>&1; do
+         sleep 1
+         i=$((i+1))
+       done
+       last_win=""
+-      while pgrep -f '/Riot Client\.app/|/League of Legends\.app/|RiotClientServices' >/dev/null 2>&1; do
++      while kill -0 "$main_pid" 2>/dev/null && pgrep -f '/Riot Client\.app/|/League of Legends\.app/|RiotClientServices' >/dev/null 2>&1; do
+         win="$(xdotool search --onlyvisible --class '^LeagueofLegends$' 2>/dev/null | head -n 1 || true)"
+         # X reuses window IDs across game matches; forget window ID once it is gone
+         [[ -z "$win" ]] && last_win=""
+diff --git a/scripts/run.sh b/scripts/run.sh
+index 5adba1d..d3dc552 100755
+--- a/scripts/run.sh
++++ b/scripts/run.sh
+@@ -64,6 +64,12 @@ export PATH="${DARLING_RUNNER_DIR:+$DARLING_RUNNER_DIR:}$repo/usr-local/bin:/usr
+ 
+ python3 scripts/configure.py >/dev/null
+ if [ -d build/venv/bin ]; then PATH="$repo/build/venv/bin:$PATH"; export PATH; fi
++
++# macOS identity stealth: enforce Apple MacBookPro16,1 GPU name and VRAM budget
++export DARLING_METAL_GPU_NAME="${DARLING_METAL_GPU_NAME:-AMD Radeon Pro 5500M}"
++export DARLING_METAL_MAC_GPU_NAME="${DARLING_METAL_MAC_GPU_NAME:-1}"
++export DARLING_METAL_VRAM_MB="${DARLING_METAL_VRAM_MB:-4096}"
++
+ # darling-lol perf: optionally wrap with gamemoderun for automatic
+ # CPU governor, nice level, and scheduler optimizations.
+ if [ "${RCLOL_GAMEMODE:-auto}" != "0" ] && command -v gamemoderun >/dev/null 2>&1; then
+diff --git a/scripts/validate.py b/scripts/validate.py
+index 57fcf9f..0493a28 100644
+--- a/scripts/validate.py
++++ b/scripts/validate.py
+@@ -12,8 +12,8 @@
+ secret_patterns=[r'gh[pousr]_[A-Za-z0-9]{30,}',r'AKIA[0-9A-Z]{16}',r'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}',r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----']
+ for name in filter(None,files):
+     p=ROOT/name;data=p.read_bytes()
+-    # The Nix desktop package intentionally ships this icon, not a runtime binary.
+-    if name == 'darling-lol.png' and data.startswith(b'\x89PNG\r\n\x1a\n'):
++    # The Nix desktop and launcher packages intentionally ship icon images, not runtime binaries.
++    if name in ('darling-lol.png', 'assets/icons/league.png') and data.startswith(b'\x89PNG\r\n\x1a\n'):
+         continue
+     if data.startswith((b'\x7fELF',b'MZ',b'\xcf\xfa\xed\xfe',b'\xca\xfe\xba\xbe')) or b'\0' in data:
+         errors.append(name+': binary content is not part of this source package');continue
+diff --git a/tests/test_launchers.py b/tests/test_launchers.py
+index ab40d52..19b367c 100644
+--- a/tests/test_launchers.py
++++ b/tests/test_launchers.py
+@@ -30,6 +30,41 @@ def test_fork_launcher_dry_run(self):
+         self.assertEqual(res.returncode, 0, f"--dry-run failed: {res.stderr}")
+         self.assertIn("[DRY-RUN] Fork Launcher Validation", res.stdout)
+ 
++    def test_upstream_launcher_blocks_unshielded_by_default(self):
++        """Verify launch-upstream.sh blocks execution by default to protect against bans."""
++        upstream_script = REPO_ROOT / "scripts/launch-upstream.sh"
++        self.assertTrue(upstream_script.is_file())
++        self.assertTrue(os.access(upstream_script, os.X_OK))
++        res = subprocess.run([str(upstream_script)], capture_output=True, text=True, check=False)
++        self.assertEqual(res.returncode, 1)
++        self.assertIn("CRITICAL SAFETY WARNING: UNSHIELDED UPSTREAM LAUNCHER BLOCKED", res.stderr)
++
++    def test_upstream_launcher_dry_run(self):
++        """Verify launch-upstream.sh --dry-run succeeds without unshielded execution."""
++        upstream_script = REPO_ROOT / "scripts/launch-upstream.sh"
++        res = subprocess.run([str(upstream_script), "--dry-run"], capture_output=True, text=True, check=False)
++        self.assertEqual(res.returncode, 0)
++        self.assertIn("[DRY-RUN] Upstream Main Launcher Validation", res.stdout)
++
++    def test_upstream_launcher_help(self):
++        """Verify launch-upstream.sh --help outputs usage without blocking."""
++        upstream_script = REPO_ROOT / "scripts/launch-upstream.sh"
++        res = subprocess.run([str(upstream_script), "--help"], capture_output=True, text=True, check=False)
++        self.assertEqual(res.returncode, 0)
++        self.assertIn("League of Legends - Darling Upstream Main Launcher", res.stdout)
++        self.assertIn("--allow-unshielded-telemetry", res.stdout)
++
++    def test_desktop_launchers_exist_and_warn(self):
++        """Verify desktop launcher entries exist and upstream contains anti-cheat warning."""
++        upstream_desktop = REPO_ROOT / "launchers/league-of-legends-upstream.desktop"
++        fork_desktop = REPO_ROOT / "launchers/league-of-legends-fork.desktop"
++        self.assertTrue(upstream_desktop.is_file())
++        self.assertTrue(fork_desktop.is_file())
++        up_text = upstream_desktop.read_text()
++        fork_text = fork_desktop.read_text()
++        self.assertIn("Warning: Upstream Main lacks anti-cheat spoofing", up_text)
++        self.assertIn("with Spoofing & Stealth", fork_text)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_stop_darling_runtime.py b/tests/test_stop_darling_runtime.py
+index 78129b4..0cb4e91 100644
+--- a/tests/test_stop_darling_runtime.py
++++ b/tests/test_stop_darling_runtime.py
+@@ -182,6 +182,28 @@ def shutdown():
+         self.assertEqual(self.signals, [])
+         self.assert_finished()
+ 
++    def test_orphaned_shared_riot_helper_terminated(self):
++        folder = self.proc / '102'
++        folder.mkdir()
++        self.status(102, 'S')
++        (folder / 'stat').write_text('102 (helper) S 1 ' + ' '.join(['0'] * 17) + ' 12345')
++        (folder / 'comm').write_text('helper')
++        (folder / 'maps').write_text(str(self.prefix / 'Users/Shared/Riot Games/Riot Client.app/helper'))
++        task = folder / 'task' / '102'
++        task.mkdir(parents=True)
++        (task / 'children').write_text('')
++
++        self.on_signal = lambda pid, sig: self.status(pid, 'Z')
++        self.run_script()
++        self.assertEqual(self.signals, [(102, signal.SIGTERM)])
++        self.assert_finished()
++
++    def test_unlisted_live_server_discovered(self):
++        self.process(100, state='S')
++        with self.assertRaisesRegex(SystemExit, 'runtime remains untouched'):
++            self.run_script()
++        self.assertEqual(len(self.calls), 1)
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/tools/darling-system_profiler.sh b/tools/darling-system_profiler.sh
+index 540b101..e52e2d2 100644
+--- a/tools/darling-system_profiler.sh
++++ b/tools/darling-system_profiler.sh
+@@ -5,8 +5,35 @@
+ # match what other APIs report (including a configure-darling-platform.py override).
+ # Installed as /usr/sbin/system_profiler by tools/install-darling-system-profiler.py.
+ host=/Volumes/SystemRoot
++[ -n "${DARLING_SYSTEM_ROOT:-}" ] && host="$DARLING_SYSTEM_ROOT"
+ xml=0
+ types=
++
++load_smbios_conf() {
++ local file="$1"
++ [ -r "$file" ] || return 1
++ while IFS='=' read -r key val || [ -n "$key" ]; do
++  case "$key" in
++   \#*|'') continue;;
++   SMBIOS_*)
++    val="${val#\"}"
++    val="${val%\"}"
++    val="${val#\'}"
++    val="${val%\'}"
++    eval "$key=\"\$val\""
++    ;;
++  esac
++ done < "$file"
++}
++
++if [ -n "${DARLING_SMBIOS_CONF:-}" ]; then
++ load_smbios_conf "$DARLING_SMBIOS_CONF"
++elif [ -r "/private/etc/darling-smbios.conf" ]; then
++ load_smbios_conf "/private/etc/darling-smbios.conf"
++elif [ -r "/etc/darling-smbios.conf" ]; then
++ load_smbios_conf "/etc/darling-smbios.conf"
++fi
++
+ while [ $# -gt 0 ]; do
+  case "$1" in
+   -xml) xml=1;;
+@@ -36,16 +63,23 @@ pci_name() { # vendor device (hex without 0x) -> "Vendor Model"
+ }
+ 
+ displays() { # one line per GPU: vendor|device|vram MB or empty|name
+- for card in "$host"/sys/class/drm/card[0-9] "$host"/sys/class/drm/card[0-9][0-9]; do
+-  [ -r "$card/device/vendor" ] || continue
+-  vendor=$(sed 's/^0x//' "$card/device/vendor"); device=$(sed 's/^0x//' "$card/device/device")
+-  vram=
+-  if [ -r "$card/device/mem_info_vram_total" ]; then
+-   vram=$(awk '{ printf "%d", $1 / 1048576 }' "$card/device/mem_info_vram_total")
+-  fi
+-  name=$(pci_name "$vendor" "$device"); [ -n "$name" ] || name="Display"
+-  echo "$vendor|$device|$vram|$name"
+- done
++ if [ "${DARLING_METAL_USE_HOST_GPU:-0}" = "1" ]; then
++  for card in "$host"/sys/class/drm/card[0-9] "$host"/sys/class/drm/card[0-9][0-9]; do
++   [ -r "$card/device/vendor" ] || continue
++   vendor=$(sed 's/^0x//' "$card/device/vendor"); device=$(sed 's/^0x//' "$card/device/device")
++   vram=
++   if [ -r "$card/device/mem_info_vram_total" ]; then
++    vram=$(awk '{ printf "%d", $1 / 1048576 }' "$card/device/mem_info_vram_total")
++   fi
++   name=$(pci_name "$vendor" "$device"); [ -n "$name" ] || name="Display"
++   echo "$vendor|$device|$vram|$name"
++  done
++  return
++ fi
++
++ # Genuine Apple GPU profile matching MacBookPro16,1
++ echo "1002|7340|4096|AMD Radeon Pro 5500M"
++ echo "8086|3e9b|1536|Intel UHD Graphics 630"
+ }
+ 
+ load_platform() { # IOPlatformExpertDevice string properties, "key|value" per line
+@@ -68,23 +102,46 @@ machine_name() { # model identifier -> marketing family, as in About This Mac
+ hardware() { # label|xml key|xml type|value for each known field
+  load_platform
+  model=$(platform model)
++ [ -n "$model" ] || model="${SMBIOS_MODEL:-}"
+  cores=$(sysctl -n hw.physicalcpu 2>/dev/null)
++ [ -n "$cores" ] || cores="${SMBIOS_CORES:-}"
+  memory=$(sysctl -n hw.memsize 2>/dev/null | awk '$1 > 0 { printf "%d GB", $1 / 1073741824 + 0.5 }')
++ [ -n "$memory" ] || memory="${SMBIOS_MEMORY:-}"
+  speed=$(sysctl -n hw.cpufrequency 2>/dev/null | awk '$1 > 0 { printf "%.1f GHz", $1 / 1e9 }')
++ [ -n "$speed" ] || speed="${SMBIOS_CPU_SPEED:-}"
+  l2=$(sysctl -n hw.l2cachesize 2>/dev/null | awk '$1 > 0 { printf "%d KB", $1 / 1024 }')
++ [ -n "$l2" ] || [ -z "$model" ] || l2="256 KB"
+  l3=$(sysctl -n hw.l3cachesize 2>/dev/null | awk '$1 > 0 { printf "%d MB", $1 / 1048576 }')
++ [ -n "$l3" ] || [ -z "$model" ] || l3="16 MB"
++ cpu_name=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
++ [ -n "$cpu_name" ] || cpu_name="${SMBIOS_CPU_BRAND:-${SMBIOS_CPU_TYPE:-}}"
++ serial=$(platform IOPlatformSerialNumber)
++ [ -n "$serial" ] || serial="${SMBIOS_SERIAL_NUMBER:-}"
++ uuid=$(platform IOPlatformUUID)
++ [ -n "$uuid" ] || uuid="${SMBIOS_PLATFORM_UUID:-}"
++ udid=$(platform provisioning_UDID)
++ [ -n "$udid" ] || udid="${SMBIOS_PROVISIONING_UDID:-}"
++ packages=$(sysctl -n hw.packages 2>/dev/null)
++ [ -n "$packages" ] || packages="${SMBIOS_PACKAGES:-}"
++
+  echo "Model Name|machine_name|string|${model:+$(machine_name "$model")}"
+  echo "Model Identifier|machine_model|string|$model"
+- echo "Processor Name|cpu_type|string|$(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
++ echo "Processor Name|cpu_type|string|$cpu_name"
+  echo "Processor Speed|current_processor_speed|string|$speed"
+- echo "Number of Processors|packages|integer|$(sysctl -n hw.packages 2>/dev/null)"
++ echo "Number of Processors|packages|integer|$packages"
+  echo "Total Number of Cores|number_processors|integer|$cores"
+  echo "L2 Cache (per Core)|l2_cache_core|string|$l2"
+  echo "L3 Cache|l3_cache|string|$l3"
+  echo "Memory|physical_memory|string|$memory"
+- echo "Serial Number (system)|serial_number|string|$(platform IOPlatformSerialNumber)"
+- echo "Hardware UUID|platform_UUID|string|$(platform IOPlatformUUID)"
+- echo "Provisioning UDID|provisioning_UDID|string|$(platform provisioning_UDID)"
++ if [ -n "${SMBIOS_BOOT_ROM_VERSION:-}" ]; then
++  echo "Boot ROM Version|boot_rom_version|string|$SMBIOS_BOOT_ROM_VERSION"
++ fi
++ if [ -n "${SMBIOS_SMC_VERSION:-}" ]; then
++  echo "SMC Version (system)|SMC_version_system|string|$SMBIOS_SMC_VERSION"
++ fi
++ echo "Serial Number (system)|serial_number|string|$serial"
++ echo "Hardware UUID|platform_UUID|string|$uuid"
++ echo "Provisioning UDID|provisioning_UDID|string|$udid"
+ }
+ 
+ software() {
+@@ -96,6 +153,10 @@ software() {
+  echo "Boot Mode|boot_mode|string|normal_boot"
+  echo "Computer Name|local_host_name|string|$(hostname -s 2>/dev/null)"
+  echo "User Name|user_name|string|${USER:-$(id -un 2>/dev/null)}"
++ if [ -n "${SMBIOS_MODEL:-}" ]; then
++  echo "Secure Virtual Memory|secure_vm|string|secure_vm_enabled"
++  echo "System Integrity Protection|system_integrity|string|integrity_enabled"
++ fi
+ }
+ 
+ overview_xml() { # $1 = _name; fields on stdin; empty values are omitted
+@@ -117,6 +178,8 @@ overview_text() { # $1 = section title, $2 = overview title; fields on stdin
+  printf '%s:\n\n    %s:\n\n' "$1" "$2"
+  while IFS='|' read -r label key kind value; do
+   [ "$key" != boot_mode ] || value=Normal
++  [ "$key" != system_integrity ] || value=Enabled
++  [ "$key" != secure_vm ] || value=Enabled
+   [ -z "$value" ] || printf '      %s: %s\n' "$label" "$value"
+  done
+  echo
+diff --git a/tools/ensure-darling-runtime.py b/tools/ensure-darling-runtime.py
+index ef46259..8e2bfd1 100644
+--- a/tools/ensure-darling-runtime.py
++++ b/tools/ensure-darling-runtime.py
+@@ -105,6 +105,14 @@ def any_server_running(proc_root=Path('/proc')):
+             continue
+         try:
+             if (proc / 'comm').read_text().strip() == 'darlingserver':
++                status = proc / 'status'
++                if status.is_file():
++                    try:
++                        state = next(line.split()[1] for line in status.read_text().splitlines() if line.startswith('State:'))
++                        if state == 'Z':
++                            continue
++                    except (OSError, StopIteration):
++                        pass
+                 return True
+         except PermissionError:
+             # A hidden process might be a server; shared buffers are global, so fail closed.
+@@ -121,10 +129,15 @@ def stop_orphaned_launchd(proc_root=Path('/proc')):
+         if not proc.name.isdigit():
+             continue
+         try:
+-            if proc.stat().st_uid != uid or (proc / 'cmdline').read_bytes().rstrip(b'\0') != b'/sbin/launchd':
++            if proc.stat().st_uid != uid:
+                 continue
+-            os.kill(int(proc.name), signal.SIGKILL)
+-            print(f'Stopped orphaned Darling launchd PID {proc.name}', flush=True)
++            cmd = (proc / 'cmdline').read_bytes().rstrip(b'\0')
++            comm = (proc / 'comm').read_text().strip()
++            if cmd == b'/sbin/launchd' or (comm == 'launchd' and b'launchd' in cmd):
++                os.kill(int(proc.name), signal.SIGKILL)
++                print(f'Stopped orphaned Darling launchd PID {proc.name}', flush=True)
++            elif comm == 'shellspawn' or b'/usr/libexec/shellspawn' in cmd:
++                os.kill(int(proc.name), signal.SIGKILL)
+         except (OSError, ValueError):
+             pass
+ 
+@@ -135,9 +148,13 @@ def stop_riot_crashpad(proc_root=Path('/proc')):
+         if not proc.name.isdigit():
+             continue
+         try:
+-            if not (proc / 'comm').read_text().startswith('chrome_crashpad') or proc.stat().st_uid != uid:
++            if proc.stat().st_uid != uid:
++                continue
++            comm = (proc / 'comm').read_text().strip()
++            cmdline = (proc / 'cmdline').read_bytes()
++            if not (comm.startswith('chrome_crashpad') or 'RiotClientCrashHandler' in comm or comm == 'mldr'):
+                 continue
+-            argv = (proc / 'cmdline').read_bytes().split(b'\0')
++            argv = cmdline.split(b'\0')
+             executable = argv[0].decode(errors='replace')
+             # Match the executable's bundle, not arbitrary arguments (a browser may mention Riot).
+             if any(bundle in executable for bundle in (
+diff --git a/tools/gen-darling-smbios.py b/tools/gen-darling-smbios.py
+index 4315a6e..2ec4c3e 100755
+--- a/tools/gen-darling-smbios.py
++++ b/tools/gen-darling-smbios.py
+@@ -302,13 +302,73 @@ def read_config(path: Path) -> dict[str, str]:
+     return result
+ 
+ 
++SYSTEM_VERSION_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++\t<key>ProductBuildVersion</key>
++\t<string>23H124</string>
++\t<key>ProductCopyright</key>
++\t<string>1983-2024 Apple Inc.</string>
++\t<key>ProductName</key>
++\t<string>macOS</string>
++\t<key>ProductUserVisibleVersion</key>
++\t<string>14.7</string>
++\t<key>ProductVersion</key>
++\t<string>14.7</string>
++\t<key>iOSSupportVersion</key>
++\t<string>14.7</string>
++</dict>
++</plist>
++"""
++
++SYSTEM_VERSION_COMPAT_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++\t<key>ProductBuildVersion</key>
++\t<string>23H124</string>
++\t<key>ProductCopyright</key>
++\t<string>1983-2024 Apple Inc.</string>
++\t<key>ProductName</key>
++\t<string>Mac OS X</string>
++\t<key>ProductUserVisibleVersion</key>
++\t<string>10.16</string>
++\t<key>ProductVersion</key>
++\t<string>10.16</string>
++\t<key>iOSSupportVersion</key>
++\t<string>14.7</string>
++</dict>
++</plist>
++"""
++
++
++def sync_system_version_plists(prefix: Path) -> None:
++    cs_dir = prefix / "System/Library/CoreServices"
++    if cs_dir.is_dir():
++        sys_ver = cs_dir / "SystemVersion.plist"
++        try:
++            sys_ver.write_text(SYSTEM_VERSION_PLIST, encoding="utf-8")
++        except Exception:
++            pass
++        sys_compat = cs_dir / "SystemVersionCompat.plist"
++        try:
++            sys_compat.write_text(SYSTEM_VERSION_COMPAT_PLIST, encoding="utf-8")
++        except Exception:
++            pass
++
++
+ def format_config(cfg: dict[str, str]) -> str:
+     lines = [
+         "# Generated by tools/gen-darling-smbios.py (GenSMBIOS / macserial compatible)",
+         "# Used by Darling iokitd (IOPlatformExpertDevice / IODeviceTree) and system_profiler.",
+     ]
+     for key in CONFIG_KEYS:
+-        lines.append(f"{key}={cfg[key]}")
++        val = cfg.get(key, "")
++        if any(c in val for c in " ();"):
++            lines.append(f'{key}="{val}"')
++        else:
++            lines.append(f"{key}={val}")
+     return "\n".join(lines) + "\n"
+ 
+ 
+@@ -331,6 +391,8 @@ def write_config_to_prefix(prefix: Path, cfg: dict[str, str]) -> Path:
+         etc_staged.chmod(0o644)
+         os.replace(etc_staged, etc_target)
+ 
++    sync_system_version_plists(prefix)
++
+     return target
+ 
+ 
+@@ -393,6 +455,7 @@ def ensure_smbios(prefix: Path, model_name: str = "MacBookPro16,1", regenerate:
+     if not regenerate:
+         existing = read_config(conf_path)
+         if is_valid_config(existing):
++            sync_system_version_plists(prefix)
+             etc_dir = prefix / "etc"
+             need_sync = (
+                 etc_dir.is_dir() and not etc_dir.is_symlink() and not (etc_dir / "darling-smbios.conf").is_file()
+diff --git a/tools/riot-smbios-hardware-check.py b/tools/riot-smbios-hardware-check.py
+index 814b6af..db08a4f 100755
+--- a/tools/riot-smbios-hardware-check.py
++++ b/tools/riot-smbios-hardware-check.py
+@@ -173,22 +173,58 @@ def test_live_darling_iokit_and_sysctl(mod):
+         "-o", str(guest_bin),
+     ], check=True)
+ 
+-    # Restart Darling so iokitd and launchd load the current prefix overlay binary and SMBIOS config
++    def is_server_or_game_running():
++        try:
++            for p in Path("/proc").iterdir():
++                if not p.name.isdigit():
++                    continue
++                try:
++                    status = p / "status"
++                    if status.is_file():
++                        try:
++                            state = next(line.split()[1] for line in status.read_text().splitlines() if line.startswith("State:"))
++                            if state == "Z":
++                                continue
++                        except (OSError, StopIteration):
++                            pass
++                    comm = (p / "comm").read_text().strip()
++                    if comm in ("darlingserver",):
++                        return True
++                    if comm in ("mldr", "CrBrowserMain", "CrGpuMain", "CrRendererMain", "CrUtilityMain", "LeagueofLegends", "RiotClientServices"):
++                        cmdline = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace")
++                        if any(k in cmdline for k in ("League", "Riot")):
++                            return True
++                except (OSError, PermissionError):
++                    continue
++        except Exception:
++            pass
++        return False
++
++    server_was_running = is_server_or_game_running()
+     stop_script = Path(__file__).resolve().with_name("stop-darling-runtime.py")
+     ensure_script = Path(__file__).resolve().with_name("ensure-darling-runtime.py")
+-    subprocess.run([sys.executable, str(stop_script)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+-    subprocess.run([sys.executable, str(ensure_script)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    if not server_was_running:
++        subprocess.run([sys.executable, str(stop_script)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++        subprocess.run([sys.executable, str(ensure_script)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
+     guest_user = os.environ.get("GUEST_USER", getpass.getuser())
+     guest_home = f"/Users/{guest_user}"
++    build_dir = str(ROOT / "build")
++    guest_dyld = f"/Volumes/SystemRoot{build_dir}:{guest_home}/RuntimeLibraries"
+     guest_env = dict(
+         os.environ,
+-        DYLD_LIBRARY_PATH=f"{guest_home}/RuntimeLibraries",
++        DYLD_LIBRARY_PATH=guest_dyld,
+         DYLD_FRAMEWORK_PATH=f"{guest_home}/RuntimeFrameworks",
+     )
+     try:
+         with tempfile.TemporaryFile(mode="w+b") as out_f:
+             res = subprocess.run(
+-                ["darling", "shell", "/Volumes/SystemRoot" + str(guest_bin)],
++                [
++                    "darling", "shell", "env",
++                    f"DYLD_LIBRARY_PATH={guest_dyld}",
++                    f"DYLD_FRAMEWORK_PATH={guest_home}/RuntimeFrameworks",
++                    "/Volumes/SystemRoot" + str(guest_bin),
++                ],
+                 env=guest_env, stdin=subprocess.DEVNULL, stdout=out_f, stderr=out_f, check=False,
+             )
+             out_f.seek(0)
+@@ -203,7 +239,12 @@ def test_live_darling_iokit_and_sysctl(mod):
+ 
+         with tempfile.TemporaryFile(mode="w+b") as sp_f, tempfile.TemporaryFile(mode="w+b") as err_f:
+             subprocess.run(
+-                ["darling", "shell", "/usr/sbin/system_profiler", "-xml", "SPHardwareDataType"],
++                [
++                    "darling", "shell", "env",
++                    f"DYLD_LIBRARY_PATH={guest_dyld}",
++                    f"DYLD_FRAMEWORK_PATH={guest_home}/RuntimeFrameworks",
++                    "/usr/sbin/system_profiler", "-xml", "SPHardwareDataType",
++                ],
+                 env=guest_env, stdin=subprocess.DEVNULL, stdout=sp_f, stderr=err_f, check=True,
+             )
+             sp_f.seek(0)
+@@ -216,7 +257,8 @@ def test_live_darling_iokit_and_sysctl(mod):
+     except (OSError, subprocess.SubprocessError) as exc:
+         return f"SKIP ({exc})"
+     finally:
+-        subprocess.run([sys.executable, str(stop_script)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++        if not server_was_running:
++            subprocess.run([sys.executable, str(stop_script)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+ 
+ 
+ def main():
+diff --git a/tools/run-riot-client.sh b/tools/run-riot-client.sh
+index 767294b..2f7b1e0 100755
+--- a/tools/run-riot-client.sh
++++ b/tools/run-riot-client.sh
+@@ -42,6 +42,8 @@ for option in RCLOL_GPU_DIRECT_PRESENT RCLOL_GPU_DIRECT_ASYNC RCLOL_GPU_DIRECT_V
+  eval 'value=${'"$option"'-1}'
+  case "$value" in 0|'') unset "$option";; *) export "$option=$value";; esac
+ done
++export DARLING_METAL_GPU_NAME="${DARLING_METAL_GPU_NAME:-AMD Radeon Pro 5500M}"
++export DARLING_METAL_VRAM_MB="${DARLING_METAL_VRAM_MB:-4096}"
+ prefix=$prefix_dir
+ # RIOT_GUEST_HOME is host-side; DYLD paths must be relative to the guest root.
+ case "$guest_home" in
+diff --git a/tools/stop-darling-runtime.py b/tools/stop-darling-runtime.py
+index c266ad3..700f4a1 100755
+--- a/tools/stop-darling-runtime.py
++++ b/tools/stop-darling-runtime.py
+@@ -22,6 +22,18 @@ def live(pid):
+         # A process can exit after status is opened but before it is read.
+         return False
+ 
++if old_pid == 0:
++    for entry in Path('/proc').iterdir():
++        if not entry.name.isdigit():
++            continue
++        try:
++            if (entry / 'comm').read_text().strip() == 'darlingserver' and live(int(entry.name)):
++                if entry.stat().st_uid == os.getuid():
++                    old_pid = int(entry.name)
++                    break
++        except (OSError, ValueError):
++            pass
++
+ def process_identity(pid):
+     try:
+         return (Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+@@ -42,9 +54,22 @@ def riot_descendants(server_pid):
+         try:
+             for children in (Path('/proc') / str(pid) / 'task').glob('*/children'):
+                 pending.extend(int(child) for child in children.read_text().split())
+-            mappings = (Path('/proc') / str(pid) / 'maps').read_text()
+-            if ('Electron Framework.framework/Versions/A/Electron Framework' in mappings or
+-                    '/Applications/Riot Client.app/' in mappings):
++            mappings = ''
++            try:
++                mappings = (Path('/proc') / str(pid) / 'maps').read_text()
++            except OSError:
++                pass
++            cmdline = ''
++            try:
++                cmdline = (Path('/proc') / str(pid) / 'cmdline').read_bytes().decode('utf-8', errors='replace')
++            except OSError:
++                pass
++            combined = mappings + '\n' + cmdline
++            if ('Electron Framework.framework/Versions/A/Electron Framework' in combined or
++                    '/Applications/Riot Client.app/' in combined or
++                    '/Users/Shared/Riot Games/' in combined or
++                    '/League of Legends.app/' in combined or
++                    'RiotClient' in combined):
+                 result[pid] = process_identity(pid)
+         except (OSError, ValueError):
+             continue
+@@ -54,29 +79,53 @@ def orphaned_riot():
+     # A dead server marker cannot enumerate its former descendants. Recover
+     # only same-user Riot mappings in this prefix with no live server ancestor.
+     result = {}
+-    riot_path = str(prefix / 'Applications/Riot Client.app') + '/'
+-    league_path = str(prefix / 'Applications/League of Legends.app') + '/'
++    riot_markers = (
++        str(prefix / 'Applications/Riot Client.app'),
++        str(prefix / 'Applications/League of Legends.app'),
++        str(prefix / 'Users/Shared/Riot Games'),
++        str(prefix / 'Users/Shared/League of Legends'),
++        'Electron Framework.framework/Versions/A/Electron Framework',
++    )
+     for entry in Path('/proc').iterdir():
+         if not entry.name.isdigit():
+             continue
+         try:
+             if entry.stat().st_uid != os.getuid():
+                 continue
+-            mappings = (entry / 'maps').read_text()
+-            if riot_path not in mappings and league_path not in mappings:
+-                continue
+             pid = int(entry.name)
++            if pid == os.getpid():
++                continue
++            mappings = ''
++            try:
++                mappings = (entry / 'maps').read_text()
++            except OSError:
++                pass
++            cmdline = ''
++            try:
++                cmdline = (entry / 'cmdline').read_bytes().decode('utf-8', errors='replace')
++            except OSError:
++                pass
++            combined = mappings + '\n' + cmdline
++            matched = any(m in combined for m in riot_markers)
++            if not matched and ('RiotClient' in cmdline or 'LeagueofLegends' in cmdline) and str(prefix) in cmdline:
++                matched = True
++            if not matched:
++                continue
++
+             ancestor = pid
+             seen = set()
+             has_server = False
+             while ancestor > 1 and ancestor not in seen:
+                 seen.add(ancestor)
+                 proc = Path('/proc') / str(ancestor)
+-                if proc.joinpath('comm').read_text().strip() == 'darlingserver' and live(ancestor):
+-                    has_server = True
++                try:
++                    if proc.joinpath('comm').read_text().strip() == 'darlingserver' and live(ancestor):
++                        has_server = True
++                        break
++                    fields = proc.joinpath('stat').read_text().rsplit(')', 1)[1].split()
++                    ancestor = int(fields[1])
++                except (OSError, ValueError, IndexError):
+                     break
+-                fields = proc.joinpath('stat').read_text().rsplit(')', 1)[1].split()
+-                ancestor = int(fields[1])
+             if not has_server:
+                 result[pid] = process_identity(pid)
+         except (OSError, ValueError, IndexError):
+@@ -93,14 +142,22 @@ def orphaned_riot():
+     raise SystemExit(f'Darling server {old_pid} has not exited; runtime remains untouched')
+ # Shutdown can leave Electron helpers or League's startup window reparented
+ # and consuming CPU/GPU time.
++def send_signal(pid, sig):
++    try:
++        os.kill(pid, sig)
++    except PermissionError:
++        try:
++            subprocess.run(['sudo', '-n', 'kill', f'-{int(sig)}', str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
++        except OSError:
++            pass
++    except ProcessLookupError:
++        pass
++
+ # Stop the observed descendants and verified serverless Riot processes in this
+ # prefix, guarding against PID reuse. Leave other live Darling sessions alone.
+ for pid, identity in owned_riot.items():
+     if identity is not None and process_identity(pid) == identity and live(pid):
+-        try:
+-            os.kill(pid, signal.SIGTERM)
+-        except ProcessLookupError:
+-            pass
++        send_signal(pid, signal.SIGTERM)
+ deadline = time.monotonic() + 3
+ while any(process_identity(pid) == identity and live(pid)
+           for pid, identity in owned_riot.items()) and time.monotonic() < deadline:
+@@ -112,10 +169,7 @@ def orphaned_riot():
+ # Riot descendants, with the same PID/start-time guard used above.
+ for pid, identity in remaining.items():
+     if process_identity(pid) == identity and live(pid):
+-        try:
+-            os.kill(pid, signal.SIGKILL)
+-        except ProcessLookupError:
+-            pass
++        send_signal(pid, signal.SIGKILL)
+ deadline = time.monotonic() + 5
+ while any(process_identity(pid) == identity and live(pid)
+           for pid, identity in remaining.items()) and time.monotonic() < deadline:
+diff --git a/tools/test-metal-device-info.cpp b/tools/test-metal-device-info.cpp
+index 45cd492..05af49c 100644
+--- a/tools/test-metal-device-info.cpp
++++ b/tools/test-metal-device-info.cpp
+@@ -68,9 +68,13 @@ int main() {
+ 	// DARLING_METAL_MAC_GPU_NAME: MacBookPro16,1 GPUs for AMD and Intel hosts; NVIDIA keeps its name.
+ 	{
+ 		using MTLDeviceInfo::macGpuName;
++		using MTLDeviceInfo::macVramBytes;
+ 		bool ok = std::string(macGpuName(0x1002)) == "AMD Radeon Pro 5500M"
+ 		       && std::string(macGpuName(0x8086)) == "Intel UHD Graphics 630"
+ 		       && macGpuName(0x10de) == nullptr
++		       && macVramBytes(0x1002) == 4096ull * 1024ull * 1024ull
++		       && macVramBytes(0x8086) == 1536ull * 1024ull * 1024ull
++		       && macVramBytes(0x10de) == 0
+ 		       && MTLDeviceInfo::resolveName(nullptr, "AMD Radeon RX 6600 (RADV NAVI23)", macGpuName(0x1002)) == "AMD Radeon Pro 5500M"
+ 		       && MTLDeviceInfo::resolveName(nullptr, "NVIDIA GeForce GTX 1060 6GB", macGpuName(0x10de)) == "NVIDIA GeForce GTX 1060 6GB"
+ 		       && MTLDeviceInfo::resolveName("My GPU", "AMD Radeon RX 6600 (RADV NAVI23)", macGpuName(0x1002)) == "My GPU";

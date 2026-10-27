@@ -1,0 +1,242 @@
+{
+  "revision": "e948b4cff0424e0937396fca6602a820b7b42811",
+  "cpu": {
+    "vendor_id": "AuthenticAMD",
+    "cpu family": "25",
+    "model": "80",
+    "model name": "AMD Ryzen 5 5500",
+    "stepping": "0"
+  },
+  "compiler": "cc (GCC) 16.2.1 20260810",
+  "harness_sha256": "ea7556c72732946bec5f2d9ec91960826efabefce0283f5145c4e5dea0cd65d6",
+  "binary_sha256": "e428fb61fff32a43f70436dcf7fa78b8dfec60aa4c6f32287bbd15c3b4b6cc0e",
+  "patch_sha256": "f0ac7e85d0a144823e556a4b90840daa2414a05259ac5580f167e8c17f78844a",
+  "patch_source": "pinned git object",
+  "feature_coverage": "named features plus raw masks for seven feature registers; host-specific, not instruction emulation",
+  "host": "Linux-7.2.9-2-cachyos-x86_64-with-glibc2.44",
+  "observations": [
+    {
+      "check": "host_instruction_subset",
+      "feature": "SSE3",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "SSSE3",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "FMA",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "SSE4_1",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "SSE4_2",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "AES",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "XSAVE",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "OSXSAVE",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "AVX",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "F16C",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "VMX",
+      "pass": false
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "PCID",
+      "pass": false
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "x2APIC",
+      "pass": false
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "RDRAND",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "BMI1",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "HLE",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "AVX2",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "BMI2",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "RTM",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "AVX512ER",
+      "pass": false
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "AVX512F",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "RDSEED",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "ADX",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "SHA",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "LZCNT",
+      "pass": true
+    },
+    {
+      "check": "host_instruction_subset",
+      "feature": "RDTSCP",
+      "pass": true
+    },
+    {
+      "check": "advertised_bits_missing_from_host",
+      "leaf": 1,
+      "register": 2,
+      "extra_mask": 19057076,
+      "pass": false
+    },
+    {
+      "check": "advertised_bits_missing_from_host",
+      "leaf": 1,
+      "register": 3,
+      "extra_mask": 2824863744,
+      "pass": false
+    },
+    {
+      "check": "advertised_bits_missing_from_host",
+      "leaf": 7,
+      "register": 1,
+      "extra_mask": 134225922,
+      "pass": false
+    },
+    {
+      "check": "advertised_bits_missing_from_host",
+      "leaf": 7,
+      "register": 2,
+      "extra_mask": 0,
+      "pass": true
+    },
+    {
+      "check": "advertised_bits_missing_from_host",
+      "leaf": 7,
+      "register": 3,
+      "extra_mask": 2617246720,
+      "pass": false
+    },
+    {
+      "check": "advertised_bits_missing_from_host",
+      "leaf": 2147483649,
+      "register": 2,
+      "extra_mask": 0,
+      "pass": true
+    },
+    {
+      "check": "advertised_bits_missing_from_host",
+      "leaf": 2147483649,
+      "register": 3,
+      "extra_mask": 0,
+      "pass": true
+    },
+    {
+      "check": "avx512er_requires_avx512f",
+      "pass": false
+    },
+    {
+      "check": "xsave_avx_component",
+      "advertised": true,
+      "component_size": 0,
+      "component_offset": 0,
+      "pass": false
+    },
+    {
+      "check": "registers_rip_flags",
+      "pass": true
+    },
+    {
+      "check": "existing_sigsegv_handler",
+      "real_page_fault": false,
+      "exit": -1,
+      "signal": 11,
+      "pass": false
+    },
+    {
+      "check": "existing_sigsegv_handler",
+      "real_page_fault": true,
+      "exit": -1,
+      "signal": 11,
+      "pass": false
+    },
+    {
+      "check": "native_cpuid_benchmark",
+      "median_ns_per_call": 36.45,
+      "samples": 9,
+      "iterations_per_sample": 10000
+    },
+    {
+      "check": "hardware_faulting",
+      "supported": false,
+      "errno": 19,
+      "trapped_benchmark": "unavailable"
+    }
+  ],
+  "scope": "Linux isolated harness of exact original functions; not a guest integration or game benchmark",
+  "trap_validation": "unavailable on this host",
+  "accepted": false
+}

@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 84161fd..5b23944 100644
+index 84161fd..af49632 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -17,6 +17,8 @@ include_directories(
@@ -11,13 +11,14 @@ index 84161fd..5b23944 100644
  
  mig(iokitmig.defs)
  mig(powermanagement.defs)
-@@ -36,7 +38,13 @@ set(iokitd_sources
+@@ -36,7 +38,14 @@ set(iokitd_sources
  	src/IODisplayConnect.mm
  	src/IODisplayConnectX11.mm
  	src/PowerAssertions.mm
 +	src/PowerSources.mm
  	src/PowerAssertionsX11.mm
 +	src/IOPlatformExpertDevice.mm
++	src/IOGraphicsAccelerator2.mm
 +	src/IOPMrootDomain.mm
 +	src/IOInterestNotification.mm
 +	src/LogindSleep.c
@@ -26,11 +27,12 @@ index 84161fd..5b23944 100644
  	src/IOSurface.mm
  	src/IOUserClient.mm
 diff --git a/src/IORegistryEntry.mm b/src/IORegistryEntry.mm
-index 50c10fe..7026e1c 100644
+index 50c10fe..2b2786d 100644
 --- a/src/IORegistryEntry.mm
 +++ b/src/IORegistryEntry.mm
-@@ -1,11 +1,15 @@
+@@ -1,11 +1,16 @@
  #include "IORegistryEntry.h"
++#include "TraceLog.h"
  #include <stack>
  #include <IOKit/IOCFSerialize.h>
 +#include <CoreFoundation/CFNumber.h>
@@ -45,7 +47,7 @@ index 50c10fe..7026e1c 100644
  #include "IOIterator.h"
  extern "C" {
  #include "iokitmigServer.h"
-@@ -29,6 +33,12 @@ IORegistryEntry::~IORegistryEntry()
+@@ -29,6 +34,12 @@ IORegistryEntry::~IORegistryEntry()
  {
  	std::unique_lock l(m_entriesByIdMutex);
  	m_entriesById.erase(m_id);
@@ -58,7 +60,7 @@ index 50c10fe..7026e1c 100644
  }
  
  IORegistryEntry* IORegistryEntry::findById(uint64_t id)
-@@ -79,29 +89,42 @@ std::set<IORegistryEntry*> IORegistryEntry::getChildren(const char* plane)
+@@ -79,29 +90,42 @@ std::set<IORegistryEntry*> IORegistryEntry::getChildren(const char* plane)
  
  void IORegistryEntry::registerInPlane(const char* plane, const char* pathName, IORegistryEntry* parent)
  {
@@ -103,7 +105,7 @@ index 50c10fe..7026e1c 100644
  		std::set<IORegistryEntry*> parents = cur->getParents(plane);
  		if (parents.empty())
  		{
-@@ -113,18 +136,22 @@ std::string IORegistryEntry::getPath(const char* plane)
+@@ -113,18 +137,22 @@ std::string IORegistryEntry::getPath(const char* plane)
  
  		components.push(cur->getName(plane));
  		
@@ -127,7 +129,7 @@ index 50c10fe..7026e1c 100644
  	}
  
  	return path;
-@@ -166,11 +193,15 @@ kern_return_t is_io_registry_entry_get_path
+@@ -166,11 +194,15 @@ kern_return_t is_io_registry_entry_get_path
  	io_string_t path
  )
  {
@@ -143,7 +145,24 @@ index 50c10fe..7026e1c 100644
  	strlcpy(path, mypath.c_str(), sizeof(io_string_t));
  
  	return kIOReturnSuccess;
-@@ -386,55 +417,59 @@ kern_return_t is_io_registry_entry_get_location_in_plane
+@@ -261,6 +293,7 @@ kern_return_t is_io_registry_entry_get_child_iterator
+ 	if (!e)
+ 		return kIOReturnBadArgument;
+ 
++	iokitTrace("[children] %s plane=%s", e->getPath(plane).c_str(), plane);
+ 	*iterator = ioRegistryCreateIterator(e, plane, 0, false, true);
+ 	return kIOReturnSuccess;
+ }
+@@ -309,6 +342,8 @@ kern_return_t is_io_registry_entry_get_properties_bin
+ 	if (!e)
+ 		return kIOReturnBadArgument;
+ 
++	iokitTrace("[properties-bin] %s", e->getPath("IOService").c_str());
++
+ 	NSDictionary* props = e->getProperties();
+ 
+ 	CFDataRef data = IOCFSerialize(props, kIOCFSerializeToBinary);
+@@ -386,55 +421,59 @@ kern_return_t is_io_registry_entry_get_location_in_plane
      return KERN_NOT_SUPPORTED;
  }
  
@@ -246,7 +265,16 @@ index 50c10fe..7026e1c 100644
  	return kIOReturnSuccess;
  }
  
-@@ -513,3 +548,189 @@ kern_return_t is_io_registry_entry_get_property_bin
+@@ -473,6 +512,8 @@ kern_return_t is_io_registry_entry_get_property_bin
+ 
+ 	// TODO: compare property_name against kIORegistryEntryPropertyKeysKey, but IOKitUser doesn't seem to use it
+ 
++	iokitTrace("[property-bin] %s %s", e->getPath(plane).c_str(), property_name);
++
+ 	*propertiesCnt = 0;
+ 	*properties = nullptr;
+ 
+@@ -513,3 +554,190 @@ kern_return_t is_io_registry_entry_get_property_bin
      return kr;
  }
  
@@ -401,6 +429,7 @@ index 50c10fe..7026e1c 100644
 +	*dataCnt = 0;
 +	auto* entry = dynamic_cast<IORegistryEntry*>(IOObject::lookup(registry_entry));
 +	if (!entry || !property_name || !memchr(property_name, 0, sizeof(io_name_t))) return kIOReturnBadArgument;
++	iokitTrace("[property-bytes] %s %s", entry->getPath("IOService").c_str(), property_name);
 +	NSString* key = [NSString stringWithUTF8String:property_name];
 +	if (!key) return kIOReturnBadArgument;
 +	id value = [entry->getProperties() objectForKey:key];
@@ -644,10 +673,10 @@ index 34e74ad..0d0740b 100644
  	std::list<IOService*> m_registeredServices;
  };
 diff --git a/src/ServiceRegistry.mm b/src/ServiceRegistry.mm
-index aaed046..7a190c3 100644
+index aaed046..faac897 100644
 --- a/src/ServiceRegistry.mm
 +++ b/src/ServiceRegistry.mm
-@@ -24,6 +24,9 @@
+@@ -24,7 +24,11 @@
  #include <IOKit/IOReturn.h>
  #include <os/log.h>
  #include <stdexcept>
@@ -655,14 +684,38 @@ index aaed046..7a190c3 100644
 +#include <cstring>
 +#include <vector>
  #include "IOIterator.h"
++#include "TraceLog.h"
  
  extern "C" {
-@@ -49,6 +52,16 @@ IOIterator* ServiceRegistry::iteratorForMatchingServices(NSDictionary* criteria)
+ #include "iokitmigServer.h"
+@@ -38,6 +42,12 @@ ServiceRegistry* ServiceRegistry::instance()
+ 
+ IOIterator* ServiceRegistry::iteratorForMatchingServices(NSDictionary* criteria) const
+ {
++	// darling-lol: records which service classes and properties a client asks for.
++	if (criteria)
++		iokitTrace("[match-iterator] %s", [[criteria description] UTF8String]);
++	else
++		iokitTrace("[match-iterator] (nil)");
++
+ 	std::vector<IOObject*> matching;
+ 
+ 	for (auto it = m_registeredServices.begin(); it != m_registeredServices.end(); it++)
+@@ -46,9 +56,25 @@ IOIterator* ServiceRegistry::iteratorForMatchingServices(NSDictionary* criteria)
+ 			matching.push_back(*it);
+ 	}
+ 
++	iokitTrace("[match-iterator] matched=%u", (unsigned) matching.size());
  	return new IOIterator(matching);
  }
  
 +IOObject* ServiceRegistry::firstMatchingService(NSDictionary* criteria) const
 +{
++	if (criteria)
++		iokitTrace("[match-first] %s", [[criteria description] UTF8String]);
++	else
++		iokitTrace("[match-first] (nil)");
++
 +	for (IOService* service : m_registeredServices)
 +	{
 +		if (service->matches(criteria))
@@ -674,7 +727,7 @@ index aaed046..7a190c3 100644
  void ServiceRegistry::registerService(IOService* service)
  {
  	m_registeredServices.push_back(service);
-@@ -118,3 +131,91 @@ kern_return_t is_io_service_get_matching_services
+@@ -118,3 +144,91 @@ kern_return_t is_io_service_get_matching_services
      // Old unsupported API
      return kIOReturnUnsupported;
  }
@@ -767,19 +820,20 @@ index aaed046..7a190c3 100644
 +	}
 +}
 diff --git a/src/main.mm b/src/main.mm
-index 37ce9b8..e23aea0 100644
+index 37ce9b8..cd53312 100644
 --- a/src/main.mm
 +++ b/src/main.mm
-@@ -32,6 +32,8 @@
+@@ -32,6 +32,9 @@
  #include "IODisplayConnectX11.h"
  #include "PowerAssertions.h"
  #include "IOSurfaceRoot.h"
 +#include "IOPlatformExpertDevice.h"
++#include "IOGraphicsAccelerator2.h"
 +#include "IOPMrootDomain.h"
  
  extern "C" {
  #include "iokitmigServer.h"
-@@ -127,6 +129,8 @@ int main(int argc, const char** argv)
+@@ -127,6 +130,8 @@ int main(int argc, const char** argv)
  	dispatch_resume(deathSource);
  	dispatch_resume(pwrMgmtPortSource);
  
@@ -788,11 +842,12 @@ index 37ce9b8..e23aea0 100644
  	os_log(OS_LOG_DEFAULT, "iokitd up and running.");
  
  	dispatch_main();
-@@ -146,5 +150,7 @@ static void discoverAllDevices()
+@@ -146,5 +151,8 @@ static void discoverAllDevices()
  	// Trick to make sure the root object gets instantiated first and gets the lowest ID
  	IORegistryEntry::root();
  	IODisplayConnectX11::discoverDevices(registry);
 +	IOPlatformExpertDevice::registerSelf(registry);
++	IOGraphicsAccelerator2::registerSelf(registry);
  	IOSurfaceRoot::registerSelf(registry);
 +	IOPMrootDomain::registerSelf(registry);
  }
@@ -3634,3 +3689,249 @@ index 0000000..6c87959
 +}
 +}
 +#endif
+diff --git a/src/TraceLog.h b/src/TraceLog.h
+new file mode 100644
+index 0000000..622eed6
+--- /dev/null
++++ b/src/TraceLog.h
+@@ -0,0 +1,42 @@
++/*
++ darling-lol: optional IORegistry observation log.
++
++ Set DARLING_IOKIT_TRACE=1 in the launcher environment to append every service-match
++ request, path lookup, child iteration and property read to /tmp/iokit-trace.log on the
++ host. The Riot anti-cheat module walks the registry generically, so the questions it
++ actually asks can only be measured, not guessed. The default (unset) writes nothing.
++*/
++#ifndef IOKITD_TRACELOG_H
++#define IOKITD_TRACELOG_H
++
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++
++static inline bool iokitTraceEnabled()
++{
++	static const bool enabled = [] {
++		const char* value = getenv("DARLING_IOKIT_TRACE");
++		return value && value[0] != '\0' && value[0] != '0';
++	}();
++	return enabled;
++}
++
++static inline void iokitTrace(const char* format, ...)
++{
++	if (!iokitTraceEnabled())
++		return;
++
++	FILE* log = fopen("/tmp/iokit-trace.log", "a");
++	if (!log)
++		return;
++
++	va_list args;
++	va_start(args, format);
++	vfprintf(log, format, args);
++	va_end(args);
++	fputc('\n', log);
++	fclose(log);
++}
++
++#endif
+diff --git a/src/IOGraphicsAccelerator2.h b/src/IOGraphicsAccelerator2.h
+new file mode 100644
+index 0000000..b345a19
+--- /dev/null
++++ b/src/IOGraphicsAccelerator2.h
+@@ -0,0 +1,42 @@
++/*
++ This file is part of Darling.
++
++ Copyright (C) 2020 Lubos Dolezel
++
++ Darling is free software: you can redistribute it and/or modify
++ it under the terms of the GNU General Public License as published by
++ the Free Software Foundation, either version 3 of the License, or
++ (at your option) any later version.
++
++ Darling is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details.
++
++ You should have received a copy of the GNU General Public License
++ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#ifndef IOKITD_IOGRAPHICSACCELERATOR2_H
++#define IOKITD_IOGRAPHICSACCELERATOR2_H
++
++#include "IOService.h"
++
++class ServiceRegistry;
++
++// darling-lol: a Mac exposes a GPU accelerator service in the IORegistry
++// (IOServiceMatching("IOGraphicsAccelerator2")). The Riot anti-cheat module asks for it,
++// so the registry reports the emulated MacBookPro16,1 GPU instead of nothing. Rendering
++// still goes through Metal/Indium; this node is identity metadata only.
++class IOGraphicsAccelerator2 : public IOService
++{
++public:
++	const char* className() const override;
++	NSDictionary* matchingDictionary() override;
++	NSDictionary* getProperties() override;
++	bool conformsTo(const char* className) override;
++
++	static void registerSelf(ServiceRegistry* targetServiceRegistry);
++};
++
++#endif
+diff --git a/src/IOGraphicsAccelerator2.mm b/src/IOGraphicsAccelerator2.mm
+new file mode 100644
+index 0000000..03bf675
+--- /dev/null
++++ b/src/IOGraphicsAccelerator2.mm
+@@ -0,0 +1,80 @@
++/*
++ This file is part of Darling.
++
++ Copyright (C) 2020 Lubos Dolezel
++
++ Darling is free software: you can redistribute it and/or modify
++ it under the terms of the GNU General Public License as published by
++ the Free Software Foundation, either version 3 of the License, or
++ (at your option) any later version.
++
++ Darling is distributed in the hope that it will be useful,
++ but WITHOUT ANY WARRANTY; without even the implied warranty of
++ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ GNU General Public License for more details.
++
++ You should have received a copy of the GNU General Public License
++ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "IOGraphicsAccelerator2.h"
++#include "ServiceRegistry.h"
++#include <IOKit/IOReturn.h>
++#import <Foundation/NSString.h>
++#import <Foundation/NSData.h>
++#import <Foundation/NSNumber.h>
++#import <Foundation/NSDictionary.h>
++#include <cstring>
++
++// darling-lol: identity of the MacBookPro16,1 discrete GPU (Navi14, 4 GB in the base
++// configuration; the memory figures elsewhere follow DARLING_METAL_VRAM_MB when set).
++// The node carries what a real accelerator publishes at the top level; the actual
++// renderer is Metal on Vulkan underneath.
++
++const char* IOGraphicsAccelerator2::className() const
++{
++	return "IOGraphicsAccelerator2";
++}
++
++NSDictionary* IOGraphicsAccelerator2::matchingDictionary()
++{
++	return @{
++		@"IOProviderClass": @"IOGraphicsAccelerator2",
++		@"IOClass": @"IOGraphicsAccelerator2",
++	};
++}
++
++NSDictionary* IOGraphicsAccelerator2::getProperties()
++{
++	static const uint32_t vendorID = 0x1002;
++	static const uint32_t deviceID = 0x7340;
++
++	return @{
++		@"IOClass": @"IOGraphicsAccelerator2",
++		@"IOProviderClass": @"IOGraphicsAccelerator2",
++		@"CFBundleIdentifier": @"com.apple.AMDRadeonX6000",
++		@"IOGLBundleName": @"AMDRadeonX6000GLDriver",
++		@"MetalPluginName": @"AMDRadeonX6000MTLDriver",
++		@"model": @"AMD Radeon Pro 5500M",
++		@"vendor-id": [NSData dataWithBytes: &vendorID length: sizeof(vendorID)],
++		@"device-id": [NSData dataWithBytes: &deviceID length: sizeof(deviceID)],
++		@"VRAM,totalMB": @(4096),
++		@"IOAcceleratorClassName": @"IOGraphicsAccelerator2",
++		@"built-in": @YES,
++	};
++}
++
++bool IOGraphicsAccelerator2::conformsTo(const char* className)
++{
++	if (std::strcmp(className, "IOGraphicsAccelerator2") == 0)
++		return true;
++	return IOService::conformsTo(className);
++}
++
++void IOGraphicsAccelerator2::registerSelf(ServiceRegistry* targetServiceRegistry)
++{
++	static IOGraphicsAccelerator2* device = new IOGraphicsAccelerator2;
++
++	targetServiceRegistry->registerService(device);
++	device->registerInPlane(kIOServicePlane, "GFX0", IORegistryEntry::root());
++}
+diff --git a/src/IOIterator.cpp b/src/IOIterator.cpp
+index 2a9e7d0..4df2713 100644
+--- a/src/IOIterator.cpp
++++ b/src/IOIterator.cpp
+@@ -18,6 +18,7 @@
+ */
+ 
+ #include "IOIterator.h"
++#include "TraceLog.h"
+ #include <IOKit/IOReturn.h>
+ extern "C" {
+ #include "iokitmigServer.h"
+@@ -60,11 +61,15 @@ kern_return_t is_io_iterator_next
+ 		IOObject* next = iter->next();
+ 		if (next != nullptr)
+ 		{
++			iokitTrace("[iterator-next] %s", next->className());
+ 			*object = next->port();
+ 			return kIOReturnSuccess;
+ 		}
+ 		else
++		{
++			iokitTrace("[iterator-next] end");
+ 			return kIOReturnNoDevice;
++		}
+ 	}
+ 	else
+ 		return kIOReturnBadArgument;
+diff --git a/src/IODisplayConnectX11.mm b/src/IODisplayConnectX11.mm
+index 17c7bb1..ab982d9 100644
+--- a/src/IODisplayConnectX11.mm
++++ b/src/IODisplayConnectX11.mm
+@@ -83,8 +83,10 @@ void IODisplayConnectX11::discoverDevices(ServiceRegistry* targetServiceRegistry
+ 												encoding: NSUTF8StringEncoding];
+ 			[name autorelease];
+ 
+-			[props setObject: @{ @"en_US": name }
+-					forKey: @(kDisplayProductName)];
++			// darling-lol: the X11 connector name (HDMI-A-1, DP-1) is a Linux artifact.
++			// Keep a real EDID's name path untouched, but a display without a usable EDID
++			// is described as the emulated laptop's internal panel instead.
++			NSString* displayName = name;
+ 
+ 			if (oinfo->crtc)
+ 			{
+@@ -128,6 +130,8 @@ void IODisplayConnectX11::discoverDevices(ServiceRegistry* targetServiceRegistry
+ 
+ 			if (needFakeEDID)
+ 			{
++				displayName = @"Color LCD";
++
+ 				// generate a fake EDID, because otherwise IOKitUser will completely disregard our serial here
+ 				uint8_t fakeEDID[128];
+ 
+@@ -147,6 +151,9 @@ void IODisplayConnectX11::discoverDevices(ServiceRegistry* targetServiceRegistry
+ 						forKey: @(kDisplaySerialNumber)];
+ 			}
+ 
++			[props setObject: @{ @"en_US": displayName }
++					forKey: @(kDisplayProductName)];
++
+ 			IODisplayConnectX11* ioDisplay = new IODisplayConnectX11(i, props);
+ 			targetServiceRegistry->registerService(ioDisplay);
+ 			ioDisplay->registerInPlane(kIOServicePlane, oinfo->name, m_root);

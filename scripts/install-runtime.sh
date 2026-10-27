@@ -21,6 +21,10 @@ python3 build/runtime/tools/ensure-darling-runtime.py
 # Darling treats a missing prefix directory as new; only then is an identity generated below.
 new_prefix=
 [ -e "$prefix_dir" ] || new_prefix=1
+# The prefix keeps a bootstrap copy of libsystem_kernel from the previous build. It shadows the
+# base that was just installed, and launchd crashes against a new libdyld when the pair differs,
+# so use the base copy for this start; the presentation step reinstalls the current one below.
+rm -f "$prefix_dir/usr/lib/system/libsystem_kernel.dylib"
 darling shell /usr/bin/true
 # The prefix has no /private/tmp of its own, so the guest falls through to the root-owned
 # installed layer and every write there (the Riot installer's temp files) fails with EACCES.

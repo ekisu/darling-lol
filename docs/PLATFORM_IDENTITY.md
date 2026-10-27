@@ -153,6 +153,77 @@ Previewing a fresh identity generates a sample; only `--write` makes it stable.
 To restore host-derived defaults after provisioning, remove both identity files
 while stopped, so a later provisioning run cannot reimport the legacy copy.
 
+## Masked hardware identity
+
+The Riot client sees a MacBookPro16,1-shaped machine, not the Linux host:
+
+- `machdep.cpu.vendor` is `GenuineIntel`, family 6, model 158, stepping 10 and the
+  brand string is `Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz`, the 6-core/12-thread
+  MacBookPro16,1 option. `machdep.cpu.features` reports the Coffee Lake leaf-1 EDX
+  set instead of the host CPUID flags. Logical CPU counts stay the host's, so the
+  mask matches a 6-core/12-thread Mac exactly; a 1:1 physical:logical ratio from
+  the core scan is halved to keep SMT siblings.
+- `kern.hostname` is `lowells-MacBook-Pro.local`; the Linux node name is not exposed.
+- `sw_vers` and `System/Library/CoreServices/SystemVersion.plist` report macOS
+  14.6 (build 23G80), matching `kern.osrelease` 23.6.0 and `kern.osversion` 23G80.
+  `SystemVersionCompat.plist` keeps the legacy 10.16 view, also with build 23G80.
+- `getifaddrs()`/`NET_RT_IFLIST` reports Mac-shaped interfaces: `lo0` for loopback,
+  `en0`.. for physical adapters, `bridgeN` for bridge-like host links and `utunN` for
+  tunnels, with deterministic Apple-OUI MACs (`3c:22:fb:..`). Host interface names and
+  hardware MACs are not exposed; sockets still use the host interfaces.
+- `MTLDevice.name` is the Mac GPU name (`DARLING_METAL_MAC_GPU_NAME`), see
+  [troubleshooting](TROUBLESHOOTING.md#metal-device-name-and-memory-budget).
+- `proc_listpids` returns a fixed list of macOS system daemons (`launchd`, `WindowServer`,
+  `Dock`, ...) plus the caller. `proc_pidinfo` answers for a listed pid only when no real
+  guest process has it; a real pid, the caller's own included, keeps its real answer,
+  because launchd reaps orphaned children through the same call. This applies to every
+  guest process, not only the Riot client.
+- `CGWindowListCopyWindowInfo` returns a desktop, Dock and menu bar window when the
+  display server reports no windows.
+
+### CPUID
+
+sysctl masks only cover code that asks the kernel. `mvg` also executes `cpuid`
+directly, which would expose the host's `AuthenticAMD` identity. With
+`DARLING_CPUID_FAULT=1` the loader enables `ARCH_SET_CPUID(0)` so every `cpuid`
+raises SIGSEGV; the existing `sigexc` handler answers the identity leaves
+(0, 1, 7, 0xB, 0x16, 0xD, 0x80000000-08) from the same Coffee Lake profile and
+passes every other leaf through to the real CPU with faulting briefly disabled.
+AVX-512 is cleared in leaves 7, 0xD and 0x80000001 because the emulated part has
+none. `tools/run-riot-client.sh` sets the variable by default; set
+`RCLOL_CPUID_FAULT=0` to disable it. The handler is compiled into dyld, so a
+`sudo cmake --install build` is required for changes to take effect. Verified in
+the guest with a Mach-O probe: `GenuineIntel`, leaf 1 `0x000906ea`, brand
+`Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz`, and host passthrough when the variable
+is unset.
+
+Each `cpuid` executed by the Riot client, the game and any native library they load
+(the Vulkan driver included) costs a signal round trip with two `arch_prctl` calls, and
+those libraries see the emulated Intel identity too. The kernel must support CPUID
+faulting (`arch_prctl(ARCH_SET_CPUID)`); without it the variable has no effect and the
+host identity is visible. The guest's environment is read from `/proc/self/environ` at
+process start.
+
+These masks change what the guest reports; they do not make the guest
+indistinguishable from a Mac, and they are no guarantee about anti-cheat decisions.
+
+Not masked: the IORegistry itself (a real Mac exposes hundreds of nodes; the guest
+exposes a handful), MAC addresses, `/Volumes/SystemRoot` paths inside the guest, and
+the host library names in the process environment.
+
+## Session collector
+
+`RCLOL_COLLECT=1 ./scripts/run.sh` starts the client under
+`tools/collect-riot-session.py`. It is off by default; `RCLOL_NO_COLLECT=1` also turns it
+off. The collector sets `DARLING_SYSCTL_TRACE=1`, `DARLING_IOKIT_TRACE=1` and
+`RCLOL_CLOSE_CLIENT_IN_GAME=1` unless they are already set. When the launcher exits, or
+receives SIGTERM, it copies the logs written since the start from the guest home's
+`Library/Logs/Riot Games`, the game's `Logs`, `private/var/log` and `private/tmp` into
+`~/darling-sessions/<start>/` and writes `SUMMARY.md`. The prefix is `DPREFIX`, else
+`build/config.json`, else `~/.darling`. Symlinks are skipped, and files over 8 MiB are
+cut to their last 4 MiB. Nothing is uploaded. The copies can name the Riot account,
+region and host GPU, so review them before sharing.
+
 ## system_profiler
 
 The prefix's `/usr/sbin/system_profiler` (installed by

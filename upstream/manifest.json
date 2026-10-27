@@ -285,7 +285,9 @@
         "darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/guarded/change_fdguard_np.c",
         "darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/mac_syscall.c",
         "libsyscall/wrappers/__sysctlbyname.S",
-        "darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h"
+        "darling/src/libsystem_kernel/emulation/include/common/cpu_frequency.h",
+        "darling/src/libsystem_kernel/emulation/include/linux_premigration/signal/cpuid_fault.h",
+        "darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/cpuid_fault.c"
       ]
     },
     {

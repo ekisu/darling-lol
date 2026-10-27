@@ -3494,7 +3494,7 @@ diff --git a/private-include/Metal/MTLDeviceInfo.h b/private-include/Metal/MTLDe
 new file mode 100644
 --- /dev/null
 +++ b/private-include/Metal/MTLDeviceInfo.h
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,165 @@
 +// SPDX-FileCopyrightText: 2026 Darling Developers
 +// SPDX-License-Identifier: MPL-2.0
 +
@@ -3594,12 +3594,11 @@ new file mode 100644
 +}
 +
 +// DARLING_METAL_GPU_NAME (used verbatim when non-empty) wins over the Vulkan name.
-+// With DARLING_METAL_MAC_GPU_NAME=1: the GPU from the host's vendor that the MacBookPro16,1
-+// iokitd reports shipped with, by Vulkan vendor ID. nullptr for other vendors (NVIDIA), which
-+// keep their own name so apps never take another vendor's driver paths.
++// With DARLING_METAL_MAC_GPU_NAME=1: the MacBookPro16,1 GPU by vendor; NVIDIA maps to AMD.
 +static inline const char* macGpuName(uint32_t vendorID) {
 +	switch (vendorID) {
-+	case 0x1002: return "AMD Radeon Pro 5500M";
++	case 0x1002:
++	case 0x10de: return "AMD Radeon Pro 5500M";
 +	case 0x8086: return "Intel UHD Graphics 630";
 +	default: return nullptr;
 +	}

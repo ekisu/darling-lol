@@ -3723,6 +3723,55 @@ index 3fac3be55..aae2c7435 100644
  
  set_property(TARGET CoreServices APPEND_STRING PROPERTY
    LINK_FLAGS " -Wl,-reexported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/reexport.exp")
+diff --git a/src/frameworks/CoreServices/SystemVersion.plist b/src/frameworks/CoreServices/SystemVersion.plist
+index ee78ea540..8d33089f6 100644
+--- a/src/frameworks/CoreServices/SystemVersion.plist
++++ b/src/frameworks/CoreServices/SystemVersion.plist
+@@ -3,16 +3,14 @@
+ <plist version="1.0">
+ <dict>
+ 	<key>ProductBuildVersion</key>
+-	<string>Darling</string>
++	<string>23G80</string>
+ 	<key>ProductCopyright</key>
+-	<string>2012-2023 Lubos Dolezel</string>
++	<string>1983-2024 Apple Inc.</string>
+ 	<key>ProductName</key>
+ 	<string>macOS</string>
+ 	<key>ProductUserVisibleVersion</key>
+-	<string>11.7.4</string>
++	<string>14.6</string>
+ 	<key>ProductVersion</key>
+-	<string>11.7.4</string>
+-	<key>iOSSupportVersion</key>
+-	<string>14.7</string>
++	<string>14.6</string>
+ </dict>
+ </plist>
+diff --git a/src/frameworks/CoreServices/SystemVersionCompat.plist b/src/frameworks/CoreServices/SystemVersionCompat.plist
+index 2ad16ea5b..cc7958865 100644
+--- a/src/frameworks/CoreServices/SystemVersionCompat.plist
++++ b/src/frameworks/CoreServices/SystemVersionCompat.plist
+@@ -3,9 +3,9 @@
+ <plist version="1.0">
+ <dict>
+ 	<key>ProductBuildVersion</key>
+-	<string>Darling</string>
++	<string>23G80</string>
+ 	<key>ProductCopyright</key>
+-	<string>2012-2023 Lubos Dolezel</string>
++	<string>1983-2024 Apple Inc.</string>
+ 	<key>ProductName</key>
+ 	<string>Mac OS X</string>
+ 	<key>ProductUserVisibleVersion</key>
+@@ -13,6 +13,6 @@
+ 	<key>ProductVersion</key>
+ 	<string>10.16</string>
+ 	<key>iOSSupportVersion</key>
+-	<string>14.7</string>
++	<string>17.6</string>
+ </dict>
+ </plist>
 diff --git a/src/frameworks/CoreServices/src/CarbonCore/UnicodeUtilities.cpp b/src/frameworks/CoreServices/src/CarbonCore/UnicodeUtilities.cpp
 index 094a9483d..84810f6ab 100644
 --- a/src/frameworks/CoreServices/src/CarbonCore/UnicodeUtilities.cpp

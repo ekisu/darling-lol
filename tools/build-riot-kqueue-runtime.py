@@ -75,7 +75,7 @@ repairs += [('src/other/mach/lkm.c',rpc_flags,emulation_root)]
 # sysctl_kern.c takes the emulated OS identity from per-source definitions (emulation/CMakeLists.txt)
 identity=['-DEMULATED_SYSNAME="Darwin"','-DEMULATED_RELEASE="23.6.0"',
     '-DEMULATED_VERSION="Darwin Kernel Version 23.6.0: Mon Jul 29 21:14:30 PDT 2024; root:xnu-10063.141.2~1/RELEASE_X86_64"',
-    '-DEMULATED_OSVERSION="23H124"','-DEMULATED_OSPRODUCTVERSION="14.7"']
+    '-DEMULATED_OSVERSION="23G80"','-DEMULATED_OSPRODUCTVERSION="14.6"']
 repairs += [('src/xnu_syscall/bsd/helper/misc/sysctl_kern.c',{**emulation_flags,'C_FLAGS':[*emulation_flags['C_FLAGS'],*identity]},emulation_root)]
 # The hw.*/machdep.cpu.* sysctls are not on the per-call path: recompile them
 # with the configured flags only because these sources changed (the same way

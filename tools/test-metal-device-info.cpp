@@ -65,14 +65,14 @@ int main() {
 		std::printf("%s name override\n", ok ? "PASS" : "FAIL");
 	}
 
-	// DARLING_METAL_MAC_GPU_NAME: MacBookPro16,1 GPUs for AMD and Intel hosts; NVIDIA keeps its name.
+	// DARLING_METAL_MAC_GPU_NAME: MacBookPro16,1 GPUs for AMD, Intel and NVIDIA hosts.
 	{
 		using MTLDeviceInfo::macGpuName;
 		bool ok = std::string(macGpuName(0x1002)) == "AMD Radeon Pro 5500M"
 		       && std::string(macGpuName(0x8086)) == "Intel UHD Graphics 630"
-		       && macGpuName(0x10de) == nullptr
+		       && std::string(macGpuName(0x10de)) == "AMD Radeon Pro 5500M"
 		       && MTLDeviceInfo::resolveName(nullptr, "AMD Radeon RX 6600 (RADV NAVI23)", macGpuName(0x1002)) == "AMD Radeon Pro 5500M"
-		       && MTLDeviceInfo::resolveName(nullptr, "NVIDIA GeForce GTX 1060 6GB", macGpuName(0x10de)) == "NVIDIA GeForce GTX 1060 6GB"
+		       && MTLDeviceInfo::resolveName(nullptr, "NVIDIA GeForce RTX 4060", macGpuName(0x10de)) == "AMD Radeon Pro 5500M"
 		       && MTLDeviceInfo::resolveName("My GPU", "AMD Radeon RX 6600 (RADV NAVI23)", macGpuName(0x1002)) == "My GPU";
 		failures += !ok;
 		std::printf("%s Mac GPU name\n", ok ? "PASS" : "FAIL");

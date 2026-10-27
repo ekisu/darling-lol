@@ -29,7 +29,7 @@ index e14e7ea..024981b 100644
  #target_link_libraries(system_kernel system_duct platform_static32 platform_static64)
  make_fat(system_kernel)
 diff --git a/darling/src/libsystem_kernel/emulation/CMakeLists.txt b/darling/src/libsystem_kernel/emulation/CMakeLists.txt
-index 5b2e765..40308eb 100644
+index 5b2e765..94d3339 100644
 --- a/darling/src/libsystem_kernel/emulation/CMakeLists.txt
 +++ b/darling/src/libsystem_kernel/emulation/CMakeLists.txt
 @@ -6,13 +6,12 @@ enable_language(ASM)
@@ -48,11 +48,19 @@ index 5b2e765..40308eb 100644
 +# Quoted values are kept off the directory-wide definitions: those are pasted unescaped
 +# into the mig command lines, which breaks the shell quoting.
 +set_source_files_properties(src/xnu_syscall/bsd/helper/misc/sysctl_kern.c PROPERTIES COMPILE_DEFINITIONS
-+	"EMULATED_SYSNAME=\"Darwin\";EMULATED_RELEASE=\"23.6.0\";EMULATED_VERSION=\"Darwin Kernel Version 23.6.0: Mon Jul 29 21:14:30 PDT 2024\\; root:xnu-10063.141.2~1/RELEASE_X86_64\";EMULATED_OSVERSION=\"23H124\";EMULATED_OSPRODUCTVERSION=\"14.7\"")
++	"EMULATED_SYSNAME=\"Darwin\";EMULATED_RELEASE=\"23.6.0\";EMULATED_VERSION=\"Darwin Kernel Version 23.6.0: Mon Jul 29 21:14:30 PDT 2024\\; root:xnu-10063.141.2~1/RELEASE_X86_64\";EMULATED_OSVERSION=\"23G80\";EMULATED_OSPRODUCTVERSION=\"14.6\"")
  
  # include src/startup for rtsig.h
  include_directories(
-@@ -134,6 +133,7 @@ set(xnu_syscall_bsd_sources
+@@ -84,6 +83,7 @@ set(linux_premigration_sources
+ 	src/linux_premigration/resources/dserver-rpc-defs.c
+ 	src/linux_premigration/signal/sig_restorer.S
+ 	src/linux_premigration/signal/sigexc.c
++	src/linux_premigration/signal/cpuid_fault.c
+ 	src/linux_premigration/elfcalls_wrapper.c
+ 	src/linux_premigration/linux-syscall.S
+ 	src/linux_premigration/vchroot_userspace.c
+@@ -134,6 +134,7 @@ set(xnu_syscall_bsd_sources
  	src/xnu_syscall/bsd/impl/guarded/guarded_close_np.c
  	src/xnu_syscall/bsd/impl/guarded/guarded_kqueue_np.c
  	src/xnu_syscall/bsd/impl/guarded/guarded_open_np.c
@@ -60,7 +68,7 @@ index 5b2e765..40308eb 100644
  	src/xnu_syscall/bsd/impl/hfs/stub.c
  	src/xnu_syscall/bsd/impl/ioctl/ioctl.c
  	src/xnu_syscall/bsd/impl/kqueue/kevent.c
-@@ -153,6 +153,7 @@ set(xnu_syscall_bsd_sources
+@@ -153,6 +154,7 @@ set(xnu_syscall_bsd_sources
  	src/xnu_syscall/bsd/impl/misc/getrlimit.c
  	src/xnu_syscall/bsd/impl/misc/getrusage.c
  	src/xnu_syscall/bsd/impl/misc/iopolicysys.c
@@ -68,7 +76,7 @@ index 5b2e765..40308eb 100644
  	src/xnu_syscall/bsd/impl/misc/proc_info.c
  	src/xnu_syscall/bsd/impl/misc/ptrace.c
  	src/xnu_syscall/bsd/impl/misc/reboot.c
-@@ -359,6 +360,11 @@ set(emulation_sources
+@@ -359,6 +361,11 @@ set(emulation_sources
  	${CMAKE_BINARY_DIR}/src/external/darlingserver/src/rpc.c
  )
  
@@ -771,6 +779,28 @@ index f6588cc..c60d8f9 100644
  };
  
  #define dserver_rpc_hooks_get_interrupt_status() (-LINUX_EINTR)
+diff --git a/darling/src/libsystem_kernel/emulation/include/linux_premigration/signal/cpuid_fault.h b/darling/src/libsystem_kernel/emulation/include/linux_premigration/signal/cpuid_fault.h
+new file mode 100644
+index 0000000..e5586e3
+--- /dev/null
++++ b/darling/src/libsystem_kernel/emulation/include/linux_premigration/signal/cpuid_fault.h
+@@ -0,0 +1,16 @@
++#ifndef _CPUID_FAULT_H
++#define _CPUID_FAULT_H
++
++#include <stdbool.h>
++#include <darling/emulation/xnu_syscall/bsd/impl/signal/sigaction.h>
++
++/* darling-lol: per-process CPUID emulation.
++ *
++ * CPUID faulting (ARCH_SET_CPUID) makes guest code trap on CPUID so the
++ * identity leaves can be answered with a coherent Mac CPU instead of the
++ * host's. Enabled by DARLING_CPUID_FAULT=1 so other Darling applications
++ * keep the untouched host behaviour. */
++void darling_cpuid_fault_init(void);
++bool darling_cpuid_fault_handle(int linux_signum, struct linux_ucontext* ctxt);
++
++#endif // _CPUID_FAULT_H
 diff --git a/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/guarded/change_fdguard_np.h b/darling/src/libsystem_kernel/emulation/include/xnu_syscall/bsd/impl/guarded/change_fdguard_np.h
 new file mode 100644
 index 0000000..ac5a0e6
@@ -1575,11 +1605,261 @@ index dc8fbb8..171746a 100644
 +{
 +	__linux_sched_yield_site("SWTYLD");
 +}
+diff --git a/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/cpuid_fault.c b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/cpuid_fault.c
+new file mode 100644
+index 0000000..7767e49
+--- /dev/null
++++ b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/cpuid_fault.c
+@@ -0,0 +1,230 @@
++/* darling-lol: CPUID faulting and identity emulation.
++ *
++ * With ARCH_SET_CPUID(0) every CPUID instruction raises SIGSEGV. The signal
++ * handler reads the faulting instruction; CPUID leaves that carry machine
++ * identity are answered from a fixed Mac profile, everything else is passed
++ * through to the real CPU with faulting temporarily disabled.
++ */
++#include <darling/emulation/common/base.h>
++#include <darling/emulation/linux_premigration/signal/cpuid_fault.h>
++#include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
++
++#ifdef __x86_64__
++
++#define ARCH_SET_CPUID 0x1012
++
++static int enabled;
++
++static const char cpu_brand[48] = "Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz";
++
++/* dyld has no libc environ, so read the kernel's copy instead. The environment
++ * can be larger than one buffer, so scan it in chunks. */
++static int env_is_set(const char* name)
++{
++	char buffer[1024];
++	static const char path[] = "/proc/self/environ";
++	size_t n = 0, pos = 0;
++	int matching = 1, value_next = 0;
++	int fd = (int) LINUX_SYSCALL(__NR_open, (long) path, 0 /* O_RDONLY */, 0);
++	if (fd < 0)
++		return 0;
++	while (name[n]) n++;
++	for (;;) {
++		long got = LINUX_SYSCALL(__NR_read, fd, (long) buffer, (long) sizeof(buffer));
++		if (got <= 0)
++			break;
++		for (long i = 0; i < got; i++) {
++			char c = buffer[i];
++			if (value_next) {
++				LINUX_SYSCALL(__NR_close, fd);
++				return c != '0' && c != '\0';
++			}
++			if (c == '\0') {
++				pos = 0;
++				matching = 1;
++				continue;
++			}
++			if (matching) {
++				if (pos < n)
++					matching = c == name[pos];
++				else if (pos == n && c == '=')
++					value_next = 1;
++				else
++					matching = 0;
++			}
++			pos++;
++		}
++	}
++	LINUX_SYSCALL(__NR_close, fd);
++	return 0;
++}
++
++static long set_cpuid_faulting(int on)
++{
++	return LINUX_SYSCALL(__NR_arch_prctl, ARCH_SET_CPUID, (unsigned long) on);
++}
++
++static void real_cpuid(unsigned leaf, unsigned sub, unsigned out[4])
++{
++	unsigned a, b, c, d;
++	__asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(leaf), "c"(sub));
++	out[0] = a; out[1] = b; out[2] = c; out[3] = d;
++}
++
++/* ARCH_SET_CPUID is per thread: re-enabling CPUID here does not affect other
++ * threads, so concurrent faults need no shared guard. If it cannot be re-enabled,
++ * report the leaf as empty instead of faulting again inside the handler. */
++static void passthrough(unsigned leaf, unsigned sub, unsigned out[4])
++{
++	if (set_cpuid_faulting(1) != 0) {
++		out[0] = out[1] = out[2] = out[3] = 0;
++		return;
++	}
++	real_cpuid(leaf, sub, out);
++	set_cpuid_faulting(0);
++}
++
++void darling_cpuid_fault_init(void)
++{
++	if (!env_is_set("DARLING_CPUID_FAULT"))
++		return;
++	if (set_cpuid_faulting(0) != 0)
++		return;
++	enabled = 1;
++}
++
++static void emulate_identity(unsigned leaf, unsigned sub, const unsigned host[4], unsigned out[4])
++{
++	out[0] = host[0]; out[1] = host[1]; out[2] = host[2]; out[3] = host[3];
++
++	switch (leaf) {
++	case 0x0:
++		out[0] = 0x16;
++		out[1] = 0x756e6547; /* Genu */
++		out[2] = 0x6c65746e; /* ntel */
++		out[3] = 0x49656e69; /* ineI */
++		break;
++	case 0x1:
++		out[0] = 0x000906ea;             /* family 6, model 158, stepping 10 */
++		out[1] = (host[1] & 0x0000ffffu)
++		       | (12u << 16)             /* logical processors */
++		       | (64u << 8);             /* CLFLUSH line size */
++		break;
++	case 0x7:
++		/* No AVX-512 on the emulated Coffee Lake part. */
++		out[1] &= ~((1u << 16) | (1u << 17) | (1u << 21) | (1u << 26) |
++		            (1u << 27) | (1u << 28) | (1u << 30) | (1u << 31));
++		out[2] &= ~((1u << 1) | (1u << 6) | (1u << 11) | (1u << 12) | (1u << 14));
++		out[3] &= ~((1u << 2) | (1u << 3) | (1u << 8) | (1u << 22) | (1u << 24) | (1u << 25));
++		break;
++	case 0xb:
++	case 0x1f:
++		if (sub == 0) {
++			out[0] = 1; out[1] = 12; out[2] = 0x100; out[3] = 0;
++		} else if (sub == 1) {
++			out[0] = 6; out[1] = 6; out[2] = 0x201; out[3] = 0;
++		} else {
++			out[0] = out[1] = out[2] = out[3] = 0;
++		}
++		break;
++	case 0xd:
++		/* Keep the XSAVE state map consistent with the masked leaf 7:
++		 * no opmask/ZMM state since AVX-512 is not advertised. */
++		if (sub == 0)
++			out[0] &= ~((1u << 5) | (1u << 6) | (1u << 7));
++		break;
++	case 0x16:
++		out[0] = 2600; out[1] = 4000; out[2] = 100; out[3] = 0;
++		break;
++	case 0x40000000:
++	case 0x40000001:
++	case 0x40000002:
++	case 0x40000003:
++	case 0x40000004:
++	case 0x40000005:
++	case 0x40000006:
++		out[0] = out[1] = out[2] = out[3] = 0; /* hide any hypervisor */
++		break;
++	case 0x80000000:
++		out[0] = 0x80000008; out[1] = out[2] = out[3] = 0;
++		break;
++	case 0x80000001:
++		/* AMD-only extended feature bits have no meaning on Intel. */
++		out[2] &= ~((1u << 2) | (1u << 6) | (1u << 11) | (1u << 12) |
++		            (1u << 16) | (1u << 21) | (1u << 22));
++		break;
++	case 0x80000002:
++	case 0x80000003:
++	case 0x80000004: {
++		const char* p = cpu_brand + (leaf - 0x80000002) * 16;
++		for (int i = 0; i < 4; i++)
++			out[i] = (unsigned)((unsigned char)p[i * 4])
++			       | ((unsigned)((unsigned char)p[i * 4 + 1]) << 8)
++			       | ((unsigned)((unsigned char)p[i * 4 + 2]) << 16)
++			       | ((unsigned)((unsigned char)p[i * 4 + 3]) << 24);
++		break;
++	}
++	case 0x80000008:
++		out[0] = 0x3027; /* 48-bit virtual, 39-bit physical */
++		break;
++	case 0x8000001e:
++	case 0x8000001d:
++		out[0] = out[1] = out[2] = out[3] = 0;
++		break;
++	default:
++		break;
++	}
++}
++
++static int is_identity_leaf(unsigned leaf)
++{
++	switch (leaf) {
++	case 0x0: case 0x1: case 0x7: case 0xb: case 0x1f: case 0x16: case 0xd:
++	case 0x40000000: case 0x40000001: case 0x40000002: case 0x40000003:
++	case 0x40000004: case 0x40000005: case 0x40000006:
++	case 0x80000000: case 0x80000001:
++	case 0x80000002: case 0x80000003: case 0x80000004:
++	case 0x80000008: case 0x8000001e: case 0x8000001d:
++		return 1;
++	default:
++		return 0;
++	}
++}
++
++bool darling_cpuid_fault_handle(int linux_signum, struct linux_ucontext* ctxt)
++{
++	if (!enabled || linux_signum != LINUX_SIGSEGV)
++		return false;
++
++	struct linux_gregset* regs = &ctxt->uc_mcontext.gregs;
++	const unsigned char* rip = (const unsigned char*)(unsigned long)regs->rip;
++	/* CPUID is the only two-byte instruction we intercept. */
++	if (rip == 0 || rip[0] != 0x0f || rip[1] != 0xa2)
++		return false;
++
++	unsigned leaf = (unsigned)regs->rax, sub = (unsigned)regs->rcx, out[4];
++	if (is_identity_leaf(leaf)) {
++		unsigned host[4];
++		passthrough(leaf, sub, host);
++		emulate_identity(leaf, sub, host, out);
++	} else {
++		passthrough(leaf, sub, out);
++	}
++	regs->rax = out[0];
++	regs->rbx = out[1];
++	regs->rcx = out[2];
++	regs->rdx = out[3];
++	regs->rip += 2;
++	return true;
++}
++
++#else /* !__x86_64__ */
++
++void darling_cpuid_fault_init(void) { }
++bool darling_cpuid_fault_handle(int linux_signum, struct linux_ucontext* ctxt)
++{
++	(void)linux_signum; (void)ctxt;
++	return false;
++}
++
++#endif
 diff --git a/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
-index 206e92e..1a763fe 100644
+index 206e92e..6df133d 100644
 --- a/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
 +++ b/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c
-@@ -151,8 +151,13 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
+@@ -1,4 +1,5 @@
+ #include <darling/emulation/linux_premigration/signal/sigexc.h>
++#include <darling/emulation/linux_premigration/signal/cpuid_fault.h>
+ 
+ #include <stddef.h>
+ #include <sys/signal.h>
+@@ -114,6 +115,7 @@ static void handle_rt_signal(int signum)
+ 
+ void sigexc_setup(void)
+ {
++	darling_cpuid_fault_init();
+ 	darling_sigexc_self();
+ 	sigexc_setup1();
+ 	sigexc_setup2();
+@@ -151,8 +153,13 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
  	int status = dserver_rpc_interrupt_enter();
  
  	if (status != 0) {
@@ -1595,7 +1875,7 @@ index 206e92e..1a763fe 100644
  	}
  
  	if (signum == SIGNAL_SIGEXC_SUSPEND) {
-@@ -267,13 +272,165 @@ static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, c
+@@ -267,13 +274,170 @@ static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, c
  #endif
  }
  
@@ -1688,6 +1968,11 @@ index 206e92e..1a763fe 100644
 +
  void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_ucontext* ctxt)
  {
++#ifdef __x86_64__
++	/* darling-lol: CPUID faults are handled entirely in userspace. */
++	if (darling_cpuid_fault_handle(linux_signum, ctxt))
++		return;
++#endif
  	int status = dserver_rpc_interrupt_enter();
 +	if (forward_native_resize_signal(linux_signum, status))
 +		return;
@@ -1762,7 +2047,7 @@ index 206e92e..1a763fe 100644
  	}
  
  	kern_printf("sigexc_handler(%d, %p, %p)\n", linux_signum, info, ctxt);
-@@ -359,7 +516,13 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
+@@ -359,7 +523,13 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
  						sizeof(sa.sa_mask));
  
  				// Resend signal to self
@@ -1866,19 +2151,18 @@ index 7d5ef80..46debb8 100644
  	[521] = sys_abort_with_payload,
  	[524] = sys_setattrlistat,
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
-index f273989..058b985 100644
+index f273989..7257f2a 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_hw.c
-@@ -9,6 +9,8 @@
+@@ -9,6 +9,7 @@
  #include <darling/emulation/xnu_syscall/bsd/helper/misc/sysctl_proc.h>
  #include <darling/emulation/linux_premigration/ext/sys/utsname.h>
  #include <darling/emulation/common/simple.h>
 +#include <darling/emulation/common/cpu_topology.h>
-+#include <darling/emulation/common/cpu_frequency.h>
  #include <darling/emulation/common/string.h>
  
  extern kern_return_t mach_port_deallocate(ipc_space_t task, mach_port_name_t name);
-@@ -16,6 +18,7 @@ extern kern_return_t host_info(mach_port_name_t host, int itype, void* hinfo, ma
+@@ -16,6 +17,7 @@ extern kern_return_t host_info(mach_port_name_t host, int itype, void* hinfo, ma
  
  /* Darling specific */
  enum {
@@ -1886,7 +2170,7 @@ index f273989..058b985 100644
  	_HW_PHYSICAL_CPU = 1000,
  	_HW_PHYSICAL_CPU_MAX,
  	_HW_LOGICAL_CPU,
-@@ -24,10 +27,14 @@ enum {
+@@ -24,10 +26,16 @@ enum {
  	_HW_CPUSUBTYPE,
  	_HW_CPUTHREADTYPE,
  	_HW_64BITCAPABLE,
@@ -1895,6 +2179,8 @@ index f273989..058b985 100644
 +	_HW_CPUFREQUENCY = 1500,
 +	_HW_CACHECONFIG = 1200,
 +	_HW_CACHESIZE,
++	_HW_PACKAGES,
++	_HW_EPHEMERAL_STORAGE,
  };
  
  static sysctl_handler(handle_availcpu);
@@ -1902,7 +2188,7 @@ index f273989..058b985 100644
  static sysctl_handler(handle_physicalcpu);
  static sysctl_handler(handle_physicalcpu_max);
  static sysctl_handler(handle_logicalcpu);
-@@ -39,11 +46,78 @@ static sysctl_handler(handle_cpusubtype);
+@@ -39,11 +47,86 @@ static sysctl_handler(handle_cpusubtype);
  static sysctl_handler(handle_cputhreadtype);
  static sysctl_handler(handle_cpu64bitcapable);
  static sysctl_handler(handle_machine);
@@ -1911,6 +2197,8 @@ index f273989..058b985 100644
 +static sysctl_handler(handle_cpufrequency_compat);
 +static sysctl_handler(handle_cacheconfig);
 +static sysctl_handler(handle_cachesize);
++static sysctl_handler(handle_packages);
++static sysctl_handler(handle_ephemeral_storage);
 +
 +/* hw.optional: CPUID leaf, output register (0-3 = eax-edx) and bit */
 +static long optional_feature(void* old, unsigned long* oldlen, unsigned int leaf, int reg, int bit)
@@ -1946,7 +2234,13 @@ index f273989..058b985 100644
 +optional_handler(avx2_0, 7, 1, 5)
 +optional_handler(bmi1, 7, 1, 3)
 +optional_handler(bmi2, 7, 1, 8)
-+optional_handler(avx512f, 7, 1, 16)
++// darling-lol: Zen 4 exposes AVX-512, the masked Coffee Lake CPU does not.
++static sysctl_handler(handle_optional_avx512f)
++{
++	sysctl_handle_size(sizeof(int));
++	*((int*) old) = 0;
++	return 0;
++}
 +
 +enum {
 +	_HW_OPTIONAL = 1100,
@@ -1982,7 +2276,7 @@ index f273989..058b985 100644
  	{ .oid = _HW_PHYSICAL_CPU, .type = CTLTYPE_INT, .exttype = "", .name = "physicalcpu", .handler = handle_physicalcpu },
  	{ .oid = _HW_PHYSICAL_CPU_MAX, .type = CTLTYPE_INT, .exttype = "", .name = "physicalcpu_max", .handler = handle_physicalcpu_max },
  	{ .oid = _HW_LOGICAL_CPU, .type = CTLTYPE_INT, .exttype = "", .name = "logicalcpu", .handler = handle_logicalcpu },
-@@ -55,7 +129,12 @@ const struct known_sysctl sysctls_hw[] = {
+@@ -55,7 +138,14 @@ const struct known_sysctl sysctls_hw[] = {
  	{ .oid = _HW_CPUTHREADTYPE, .type = CTLTYPE_INT, .exttype = "", .name = "cputhreadtype", .handler = handle_cputhreadtype },
  	{ .oid = _HW_64BITCAPABLE, .type = CTLTYPE_INT, .exttype = "", .name = "cpu64bit_capable", .handler = handle_cpu64bitcapable },
  	{ .oid = HW_MACHINE, .type = CTLTYPE_STRING, .exttype = "S", .name = "machine", .handler = handle_machine },
@@ -1991,12 +2285,14 @@ index f273989..058b985 100644
 +	{ .oid = HW_MODEL, .type = CTLTYPE_STRING, .exttype = "S", .name = "model", .handler = handle_model },
 +	{ .oid = _HW_CPUFREQUENCY, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "cpufrequency", .handler = handle_cpufrequency },
 +	{ .oid = _HW_CPUFREQUENCY_COMPAT, .type = CTLTYPE_INT, .exttype = "I", .name = "cpufrequency_compat", .handler = handle_cpufrequency_compat },
++	{ .oid = _HW_PACKAGES, .type = CTLTYPE_INT, .exttype = "", .name = "packages", .handler = handle_packages },
++	{ .oid = _HW_EPHEMERAL_STORAGE, .type = CTLTYPE_INT, .exttype = "", .name = "ephemeral_storage", .handler = handle_ephemeral_storage },
 +	{ .oid = _HW_CACHECONFIG, .type = CTLTYPE_OPAQUE, .exttype = "Q", .name = "cacheconfig", .handler = handle_cacheconfig },
 +	{ .oid = _HW_CACHESIZE, .type = CTLTYPE_OPAQUE, .exttype = "Q", .name = "cachesize", .handler = handle_cachesize },
  	{ .oid = -1 }
  };
  
-@@ -71,6 +150,32 @@ static const struct host_basic_info* gethostinfo(void)
+@@ -71,6 +161,41 @@ static const struct host_basic_info* gethostinfo(void)
  		hself = mach_host_self();
  		host_info(hself, HOST_BASIC_INFO, &hinfo, &hcount);
  		mach_port_deallocate(mach_task_self(), hself);
@@ -2012,10 +2308,19 @@ index f273989..058b985 100644
 +
 +		if (topo->detected && !topo->fixed)
 +		{
++			// darling-lol: when the core scan falls back to a 1:1 ratio, report
++			// SMT siblings like the masked Coffee Lake CPU (6 cores / 12 threads).
++			unsigned int physical = topo->physical_available;
++			unsigned int physical_max = topo->physical_online;
++
++			if (physical == topo->available && physical > 1 && physical % 2 == 0)
++				physical /= 2;
++			if (physical_max == topo->online && physical_max > 1 && physical_max % 2 == 0)
++				physical_max /= 2;
 +			hinfo.avail_cpus = topo->available;
 +			hinfo.max_cpus = topo->online;
-+			hinfo.physical_cpu = topo->physical_available;
-+			hinfo.physical_cpu_max = topo->physical_online;
++			hinfo.physical_cpu = physical;
++			hinfo.physical_cpu_max = physical_max;
 +			hinfo.logical_cpu = topo->available;
 +			hinfo.logical_cpu_max = topo->online;
 +		}
@@ -2029,7 +2334,7 @@ index f273989..058b985 100644
  	}
  
  	return &hinfo;
-@@ -83,6 +188,13 @@ sysctl_handler(handle_availcpu)
+@@ -83,6 +208,13 @@ sysctl_handler(handle_availcpu)
  	return 0;
  }
  
@@ -2043,64 +2348,38 @@ index f273989..058b985 100644
  sysctl_handler(handle_physicalcpu)
  {
  	sysctl_handle_size(sizeof(int));
-@@ -169,16 +281,49 @@ sysctl_handler(handle_cputhreadtype)
+@@ -169,15 +301,24 @@ sysctl_handler(handle_cputhreadtype)
  	return 0;
  }
  
-+static long cpu_frequency(uint64_t* frequency)
-+{
-+	char buffer[32];
-+	const char* paths[] = {
-+		"/Volumes/SystemRoot/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
-+		"/Volumes/SystemRoot/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq",
-+		"/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
-+		"/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"
-+	};
-+	for (unsigned i = 0; i < sizeof(paths)/sizeof(paths[0]); ++i)
-+		if (read_string(paths[i], buffer, sizeof(buffer)) && darling_frequency_hz(buffer, frequency)) return 0;
-+#if defined(__i386__) || defined(__x86_64__)
-+	unsigned int a, b, c, d;
-+	__asm__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "0"(0), "2"(0));
-+	if (a >= 0x16) {
-+		__asm__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "0"(0x16), "2"(0));
-+		if (a & 0xffff) {
-+			*frequency = (uint64_t)(a & 0xffff) * 1000000;
-+			return 0;
-+		}
-+	}
-+#endif
-+	return -ENOENT;
-+}
++// darling-lol: the host's boost clock (5.1 GHz on Zen 4) contradicted the masked
++// i7-9750H; macOS reports the nominal 2.6 GHz for that CPU. Both OIDs report it, so the
++// legacy numeric query does not expose the host clock either.
++#define MASKED_CPU_FREQUENCY 2600000000ULL
 +
  sysctl_handler(handle_cpufrequency)
  {
 -	int freq = 2400000;
 -	char buf[16];
-+	uint64_t frequency;
-+	sysctl_handle_size(sizeof(frequency));
-+	long result = cpu_frequency(&frequency);
-+	if (!result) *((uint64_t*)old) = frequency;
-+	return result;
++	sysctl_handle_size(sizeof(uint64_t));
++	*((uint64_t*) old) = MASKED_CPU_FREQUENCY;
++	return 0;
 +}
  
 -	if (read_string("/sys/bus/cpu/devices/cpu0/cpufreq/cpuinfo_max_freq", buf, sizeof(buf)))
 -		freq = __simple_atoi(buf, NULL);
 -	*((int*) old) = freq;
 -	
--	return 0;
 +sysctl_handler(handle_cpufrequency_compat)
 +{
 +	// Numeric HW_CPU_FREQ retains XNU's legacy 32-bit ABI. Modern by-name
 +	// queries use the separate 64-bit OID above, as in kern_mib.c.
-+	uint64_t frequency;
 +	sysctl_handle_size(sizeof(uint32_t));
-+	long result = cpu_frequency(&frequency);
-+	if (!result) *((uint32_t*)old) = (uint32_t)frequency;
-+	return result;
++	*((uint32_t*) old) = (uint32_t) MASKED_CPU_FREQUENCY;
+ 	return 0;
  }
  
- sysctl_handler(handle_cpu64bitcapable)
-@@ -193,3 +338,104 @@ sysctl_handler(handle_machine)
+@@ -193,3 +334,121 @@ sysctl_handler(handle_machine)
  	copyout_string(need_uname()->machine, (char*) old, oldlen);
  	return 0;
  }
@@ -2168,6 +2447,23 @@ index f273989..058b985 100644
 +	return false;
 +}
 +
++// darling-lol: hw.packages was missing, so the Riot anti-cheat module's sysctlbyname()
++// call failed where every real Mac answers 1 (no Mac ships a multi-socket board).
++// darling-lol: macOS 13+ exposes hw.ephemeral_storage; an Intel T2 Mac answers 0.
++sysctl_handler(handle_ephemeral_storage)
++{
++	sysctl_handle_size(sizeof(int));
++	*((int*) old) = 0;
++	return 0;
++}
++
++sysctl_handler(handle_packages)
++{
++	sysctl_handle_size(sizeof(int));
++	*((int*) old) = 1;
++	return 0;
++}
++
 +// hw.cacheconfig[0] is the number of logical CPUs, [n] the number of CPUs sharing a level n cache
 +sysctl_handler(handle_cacheconfig)
 +{
@@ -2206,10 +2502,46 @@ index f273989..058b985 100644
 +	return 0;
 +}
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c
-index bd9cdc2..83ad15c 100644
+index bd9cdc2..81ed99f 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_kern.c
-@@ -139,18 +139,23 @@ sysctl_handler(handle_boottime)
+@@ -23,6 +23,11 @@
+ enum {
+ 	_KERN_MSGBUF = 1000,
+ 	_KERN_OSPRODUCTVERSION,
++	_KERN_SECURE_KERNEL,
++	_KERN_OSVARIANT_STATUS,
++	_KERN_BOOTARGS,
++	_KERN_TSCM_AVAILABLE,
++	_KERN_NUM_FILES,
+ 
+ 	_KERN_SEMMNS = 1000,
+ };
+@@ -38,6 +43,11 @@ static sysctl_handler(handle_domainname);
+ static sysctl_handler(handle_osrelease);
+ static sysctl_handler(handle_version);
+ static sysctl_handler(handle_osversion);
++static sysctl_handler(handle_secure_kernel);
++static sysctl_handler(handle_osvariant_status);
++static sysctl_handler(handle_bootargs);
++static sysctl_handler(handle_tcsm_available);
++static sysctl_handler(handle_num_files);
+ static sysctl_handler(handle_maxproc);
+ static sysctl_handler(handle_netboot);
+ static sysctl_handler(handle_safeboot);
+@@ -76,6 +86,11 @@ const struct known_sysctl sysctls_kern[] = {
+ 	{ .oid = KERN_USRSTACK64, .type = CTLTYPE_QUAD, .exttype = "Q", .name = "usrstack64", .handler = handle_usrstack64 },
+ 	{ .oid = _KERN_OSPRODUCTVERSION, .type = CTLTYPE_STRING, .exttype = "S", .name = "osproductversion", .handler = handle_osproductversion },
+ 	{ .oid = KERN_OSREV, .type = CTLTYPE_INT, .exttype = "I", .name = "osrevision", .handler = handle_osrevision },
++	{ .oid = _KERN_SECURE_KERNEL, .type = CTLTYPE_INT, .exttype = "I", .name = "secure_kernel", .handler = handle_secure_kernel },
++	{ .oid = _KERN_OSVARIANT_STATUS, .type = CTLTYPE_INT, .exttype = "I", .name = "osvariant_status", .handler = handle_osvariant_status },
++	{ .oid = _KERN_BOOTARGS, .type = CTLTYPE_STRING, .exttype = "S", .name = "bootargs", .handler = handle_bootargs },
++	{ .oid = _KERN_TSCM_AVAILABLE, .type = CTLTYPE_INT, .exttype = "I", .name = "tcsm_available", .handler = handle_tcsm_available },
++	{ .oid = _KERN_NUM_FILES, .type = CTLTYPE_INT, .exttype = "I", .name = "num_files", .handler = handle_num_files },
+ 	{ .oid = KERN_SYSV, .type = CTLTYPE_NODE, .exttype = "", .name = "sysv", .subctls = sysctls_kern_sysv },
+ 	{ .oid = -1 }
+ };
+@@ -139,18 +154,23 @@ sysctl_handler(handle_boottime)
  	// Fill in struct timeval { tv_sec, tv_usec }
  	struct sysinfo info;
  	struct bsd_timeval* tv;
@@ -2239,8 +2571,94 @@ index bd9cdc2..83ad15c 100644
  
  		// we don't want the microseconds to be constantly jumping around
  		// (that actually causes an infinite loop in `_mach_boottime_usec` in libc)
+@@ -213,7 +233,9 @@ sysctl_handler(handle_hostname)
+ 	int rv = 0;
+ 	
+ 	need_uname();
+-	copyout_string(lu.nodename, (char*) old, oldlen);
++	// darling-lol: the guest reported the Linux host's node name ("lowell"), which
++	// no Mac produces; a Mac's kernel host name is its LocalHostName plus ".local".
++	copyout_string("lowells-MacBook-Pro.local", (char*) old, oldlen);
+ 	
+ 	if (_new && newlen > 0)
+ 	{
+@@ -326,7 +348,73 @@ sysctl_handler(handle_usrstack64)
+ 	return 0;
+ }
+ 
+-static sysctl_handler(handle_osproductversion) {
++static // darling-lol: the client and the anti-cheat module probe the macOS security keys. Missing
++// entries answered ENOENT, which no real Mac does; these report the emulated T2 Intel Mac.
++sysctl_handler(handle_secure_kernel)
++{
++	sysctl_handle_size(sizeof(int));
++	*((int*) old) = 1;
++	return 0;
++}
++
++sysctl_handler(handle_osvariant_status)
++{
++	sysctl_handle_size(sizeof(int));
++	*((int*) old) = 0;
++	return 0;
++}
++
++sysctl_handler(handle_bootargs)
++{
++	copyout_string("", (char*) old, oldlen);
++	return 0;
++}
++
++sysctl_handler(handle_tcsm_available)
++{
++	sysctl_handle_size(sizeof(int));
++	*((int*) old) = 1;
++	return 0;
++}
++
++// Minimal layout of the Linux dirent64 record (the shim builds for x86-64 only here).
++struct darling_dirent64
++{
++	unsigned long long d_ino;
++	long long d_off;
++	unsigned short d_reclen;
++	unsigned char d_type;
++	char d_name[1];
++};
++
++sysctl_handler(handle_num_files)
++{
++	char buffer[2048];
++	long total = 0;
++	int fd = sys_open_nocancel("/proc/self/fd", BSD_O_RDONLY | BSD_O_DIRECTORY, 0);
++
++	sysctl_handle_size(sizeof(int));
++	if (fd >= 0) {
++		for (;;) {
++			long got = LINUX_SYSCALL3(__NR_getdents64, fd, buffer, sizeof(buffer));
++			if (got <= 0)
++				break;
++			for (long offset = 0; offset < got;) {
++				struct darling_dirent64* entry = (struct darling_dirent64*) (buffer + offset);
++				total++;
++				offset += entry->d_reclen;
++			}
++		}
++		close_internal(fd);
++		total -= 2; // "." and ".."
++		if (total < 0)
++			total = 0;
++	}
++	*((int*) old) = (int) total;
++	return 0;
++}
++
++sysctl_handler(handle_osproductversion) {
+ 	copyout_string(EMULATED_OSPRODUCTVERSION, (char*)old, oldlen);
+ 	return 0;
+ };
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
-index 4319355..122ad3a 100644
+index 4319355..577dd10 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_machdep.c
 @@ -4,6 +4,7 @@
@@ -2259,7 +2677,7 @@ index 4319355..122ad3a 100644
  };
  
  static sysctl_handler(handle_vendor);
-@@ -32,9 +34,15 @@ static sysctl_handler(handle_max_basic);
+@@ -32,9 +34,17 @@ static sysctl_handler(handle_max_basic);
  static sysctl_handler(handle_family);
  static sysctl_handler(handle_model);
  static sysctl_handler(handle_stepping);
@@ -2267,7 +2685,9 @@ index 4319355..122ad3a 100644
 -static sysctl_handler(handle_features);
 +static sysctl_handler(handle_brand_string)
 +{
-+	copyout_string("Intel(R) Core(TM) i9-9980HK CPU @ 2.40GHz", (char*) old, oldlen);
++	// darling-lol: the i7-9750H is the MacBookPro16,1 6-core/12-thread option,
++	// matching the 12 logical CPUs the host topology reports.
++	copyout_string("Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz", (char*) old, oldlen);
 +	return 0;
 +}
 +
@@ -2277,7 +2697,7 @@ index 4319355..122ad3a 100644
  
  const struct known_sysctl sysctls_machdep_cpu[] = {
      { .oid = _CPU_MAX_BASIC, .type = CTLTYPE_INT, .exttype = "I", .name = "max_basic", .handler = handle_max_basic },
-@@ -42,9 +50,10 @@ const struct known_sysctl sysctls_machdep_cpu[] = {
+@@ -42,9 +52,10 @@ const struct known_sysctl sysctls_machdep_cpu[] = {
      { .oid = _CPU_FAMILY, .type = CTLTYPE_INT, .exttype = "I", .name = "family", .handler = handle_family },
  		{ .oid = _CPU_MODEL, .type = CTLTYPE_INT, .exttype = "I", .name = "model", .handler = handle_model },
  		{ .oid = _CPU_STEPPING, .type = CTLTYPE_INT, .exttype = "I", .name = "stepping", .handler = handle_stepping },
@@ -2289,7 +2709,83 @@ index 4319355..122ad3a 100644
  	{ .oid = -1 }
  };
  
-@@ -154,38 +163,37 @@ sysctl_handler(handle_stepping)
+@@ -80,23 +91,10 @@ static inline void copyout_int(int value, char* to_copy, size_t* to_copy_length)
+ 
+ sysctl_handler(handle_vendor)
+ {
+-	unsigned int level = 0;
+-    unsigned int eax = 0;
+-	union
+-	{
+-		struct
+-		{
+-	    	unsigned int ebx;
+-		    unsigned int edx;
+-	    	unsigned int ecx;
+-		};
+-		char name[13];
+-	} v;
+-
+-    __cpuid(level, eax, v.ebx, v.ecx, v.edx);
+-
+-	v.name[12] = 0;
+-	copyout_string(v.name, (char*) old, oldlen);
++	// darling-lol: a Mac never reports the host CPUID vendor; the sysctl set is
++	// masked as one Coffee Lake MacBookPro16,1 CPU, so an AMD host does not answer
++	// "AuthenticAMD" next to an Intel brand string.
++	copyout_string("GenuineIntel", (char*) old, oldlen);
+ 
+ 	return 0;
+ }
+@@ -115,77 +113,62 @@ sysctl_handler(handle_max_basic)
+ 
+ sysctl_handler(handle_family)
+ {
+-    setup(1);
+-
+-    __cpuid(level, eax, ebx, ecx, edx);
+-
+-    eax = eax >> 7;
+-    eax &= 15;
+-
+-    copyout_int(eax, old, oldlen);
++    // darling-lol: fixed Coffee Lake identity (matches the brand string).
++    sysctl_handle_size(sizeof(int));
++    *((int*) old) = 6;
+ 
+     return 0;
+ }
+ 
+ sysctl_handler(handle_model)
+ {
+-    setup(1);
+-
+-    __cpuid(level, eax, ebx, ecx, edx);
+-
+-    eax = eax >> 3;
+-    eax &= 15;
+-
+-    copyout_int(eax,(char*)old, oldlen);
++    // darling-lol: fixed Coffee Lake identity: base model 0xE, extended 0x9.
++    sysctl_handle_size(sizeof(int));
++    *((int*) old) = 158;
+ 
+     return 0;
+ }
+ 
+ sysctl_handler(handle_stepping)
+ {
+-    setup(1);
+-
+-    __cpuid(level, eax, ebx, ecx, edx);
+-
+-    eax &= 15;
+-
+-    copyout_int(eax,(char*)old, oldlen);
++    // darling-lol: fixed Coffee Lake identity.
++    sysctl_handle_size(sizeof(int));
++    *((int*) old) = 10;
+ 
      return 0;
  }
  
@@ -2303,7 +2799,6 @@ index 4319355..122ad3a 100644
 -
 -    if (eax < 0x80000004) // the information is not implemented
 -        return 2;
--
 +	union
 +	{
 +		unsigned int brand[12];
@@ -2313,14 +2808,15 @@ index 4319355..122ad3a 100644
  
 +	__asm__("cpuid" : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx) : "0" (0x80000000u), "2" (0));
  
++	if (eax < 0x80000004) // the information is not implemented
++		return -ENOENT;
+ 
 -    union
 -    {
 -        unsigned int brand[12];
 -        char name[49];
 -    } v;
-+	if (eax < 0x80000004) // the information is not implemented
-+		return -ENOENT;
- 
+-
 -		for (int i = 1; i < 4; i++)
 -		{
 -				eax = 0x80000000+i;
@@ -2351,91 +2847,116 @@ index 4319355..122ad3a 100644
  
  sysctl_handler(handle_features)
  {
-@@ -269,45 +277,54 @@ sysctl_handler(handle_features)
+@@ -196,7 +179,9 @@ sysctl_handler(handle_features)
+                         "MCA", "CMOV", "PAT", "PSE-36", "PSN", "CLFSH", "", "DS", "ACPI", "MMX", "FXSR", "SSE", "SSE2", "SS",
+                         "HTT", "TM","IA64","PBE"};
+ 
+-    __cpuid(0,eax,ebx,ecx,edx);
++    // darling-lol: the host's real CPUID leaf 1 leaks AMD-only flag combinations.
++    // Report the Coffee Lake EDX set the brand string claims.
++    edx = 0xBFEBFBFF;
+     int current_length = 0;
+ 
+     if (old != NULL)
+@@ -269,45 +254,59 @@ sysctl_handler(handle_features)
  // TODO: i doubt core count is ever going to change.
  //       this is something that could be cached if we had some way of doing something only once in libsystem_kernel (i.e. a simple version of dispatch_once).
  sysctl_handler(handle_core_count) {
 -	// it's easier to use /proc/cpuinfo for this.
 -	// using cpuid directly is more difficult because AMD processors don't use the same method as Intel processors.
+-
+-	int infofd = sys_open_nocancel("/proc/cpuinfo", BSD_O_RDONLY, 0);
+-	struct rdline_buffer rbuf;
+-	const char* line;
+-
+-	// a reasonable default
+-	size_t core_count = 1;
+-
+-	if (infofd < 0)
+-		goto out;
+-
+-	_readline_init(&rbuf);
+-
+-	while ((line = _readline(infofd, &rbuf)) != NULL) {
+-		if (strncmp(line, "cpu cores", 9) != 0) {
+-			continue;
 +	// the topology probe (shared with the hw.* sysctls) reads the host's
 +	// package/core ids and caches the answer; fall back to /proc/cpuinfo when
 +	// the host doesn't expose /sys.
 +	const struct darling_cpu_topology* topo = darling_host_cpu_topology();
 +	size_t core_count = (topo->detected && !topo->fixed) ? topo->physical_online : 0;
++
++	// darling-lol: a 1:1 logical:physical ratio contradicts the masked SMT CPU.
++	if (topo->detected && !topo->fixed && core_count == topo->online
++			&& core_count > 1 && core_count % 2 == 0)
++		core_count /= 2;
 +	int infofd = -1;
- 
--	int infofd = sys_open_nocancel("/proc/cpuinfo", BSD_O_RDONLY, 0);
--	struct rdline_buffer rbuf;
--	const char* line;
++
 +	if (core_count == 0) {
 +		// it's easier to use /proc/cpuinfo for this.
 +		// using cpuid directly is more difficult because AMD processors don't use the same method as Intel processors.
- 
--	// a reasonable default
--	size_t core_count = 1;
++
 +		infofd = sys_open_nocancel("/proc/cpuinfo", BSD_O_RDONLY, 0);
 +		struct rdline_buffer rbuf;
 +		const char* line;
- 
--	if (infofd < 0)
--		goto out;
++
 +		// a reasonable default
 +		core_count = 1;
- 
--	_readline_init(&rbuf);
++
 +		if (infofd < 0)
 +			goto out;
- 
--	while ((line = _readline(infofd, &rbuf)) != NULL) {
--		if (strncmp(line, "cpu cores", 9) != 0) {
--			continue;
--		}
++
 +		_readline_init(&rbuf);
- 
--		// great, we've got "cpu cores"
--		// now find the actual number
--		while (*line != ':' && *line != '\0')
--			++line;
++
 +		while ((line = _readline(infofd, &rbuf)) != NULL) {
 +			if (strncmp(line, "cpu cores", 9) != 0) {
 +				continue;
 +			}
- 
--		// shouldn't happen, but just in case
--		if (*line == '\0')
--			continue;
++
 +			// great, we've got "cpu cores"
 +			// now find the actual number
 +			while (*line != ':' && *line != '\0')
 +				++line;
- 
--		++line; // skip the colon
--		if (*line == '\0')
--			continue;
++
 +			// shouldn't happen, but just in case
 +			if (*line == '\0')
 +				continue;
- 
--		++line; // skip the space
--		if (*line == '\0')
--			continue;
++
 +			++line; // skip the colon
 +			if (*line == '\0')
 +				continue;
- 
--		core_count = __simple_atoi(line, NULL);
--		break;
++
 +			++line; // skip the space
 +			if (*line == '\0')
 +				continue;
 +
 +			core_count = __simple_atoi(line, NULL);
 +			break;
-+		}
+ 		}
+-
+-		// great, we've got "cpu cores"
+-		// now find the actual number
+-		while (*line != ':' && *line != '\0')
+-			++line;
+-
+-		// shouldn't happen, but just in case
+-		if (*line == '\0')
+-			continue;
+-
+-		++line; // skip the colon
+-		if (*line == '\0')
+-			continue;
+-
+-		++line; // skip the space
+-		if (*line == '\0')
+-			continue;
+-
+-		core_count = __simple_atoi(line, NULL);
+-		break;
  	}
  
  out:
-@@ -319,3 +336,21 @@ out:
+@@ -319,3 +318,21 @@ out:
  		*oldlen = sizeof(uint32_t);
  	return 0;
  }
@@ -2458,10 +2979,18 @@ index 4319355..122ad3a 100644
 +	return 0;
 +}
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_net.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_net.c
-index 8fabdda..6cc204e 100644
+index 8fabdda..309c9c8 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_net.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_net.c
-@@ -22,6 +22,7 @@ static sysctl_handler(handle_route);
+@@ -11,6 +11,7 @@
+ #include <darling/emulation/xnu_syscall/bsd/helper/network/duct.h>
+ #include <darling/emulation/xnu_syscall/bsd/impl/ioctl/ioctl.h>
+ #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
++#include <darling/emulation/common/simple.h>
+ 
+ extern void* memset(void* destination, int value, size_t length);
+ extern void* memcpy(void* destination, const void* source, size_t n);
+@@ -22,6 +23,7 @@ static sysctl_handler(handle_route);
  static int do_iflist(void* old, unsigned long* oldlen);
  
  #define LINUX_SIOCGIFCONF 0x8912
@@ -2469,23 +2998,131 @@ index 8fabdda..6cc204e 100644
  #define LINUX_SIOCGIFHWADDR 0x8927
  #define LINUX_SIOCGIFBRDADDR 0x8919
  #define LINUX_SIOCGIFNETMASK 0x891b
-@@ -144,6 +145,16 @@ static int do_iflist(void* old, unsigned long* oldlen) {
+@@ -92,6 +94,75 @@ static unsigned long round_up_sizeof_u32(unsigned long number) {
+ 	return (number + (sizeof(uint32_t) - 1)) & ~(sizeof(uint32_t) - 1);
+ }
  
- 			memcpy(dl->sdl_data, curr->lifr_name, name_len);
++// darling-lol: the Riot anti-cheat module asks getifaddrs()/NET_RT_IFLIST, so the guest
++// used to report the Linux interface names (enp6s0, wlan0, docker0, veth...) and the
++// host's real MAC addresses. A Mac exposes lo0 plus en*/bridge*/utun* names, so map the
++// host list onto that shape and synthesize Apple-OUI MACs. Only this view changes; sockets
++// and ioctls keep using the host interfaces.
++#define DARLING_IF_NAME_MAX 16
++static const unsigned char kDarlingIfOui[3] = { 0x3c, 0x22, 0xfb }; /* Apple */
++
++static int darling_if_starts_with(const char* name, const char* prefix)
++{
++	while (*prefix) {
++		if (*name++ != *prefix++)
++			return 0;
++	}
++	return 1;
++}
++
++// Stable per-boot mapping: en0, en1, ... for physical adapters, bridgeN for bridge-like
++// host interfaces, utunN for tunnels. Virtual container links are still reported, as en
++// interfaces, because dropping them would hide host addresses from address enumeration.
++static void darling_map_ifname(const char* host, unsigned int* en, unsigned int* bridge,
++		unsigned int* utun, char* out)
++{
++	unsigned int value;
++
++	if (host[0] == 'l' && host[1] == 'o' && host[2] == '\0') {
++		strlcpy(out, "lo0", DARLING_IF_NAME_MAX);
++		return;
++	}
++	if (darling_if_starts_with(host, "docker") || darling_if_starts_with(host, "br-")
++			|| darling_if_starts_with(host, "virbr") || darling_if_starts_with(host, "bridge")) {
++		value = (*bridge)++;
++		__simple_sprintf(out, "bridge%u", value);
++		return;
++	}
++	if (darling_if_starts_with(host, "tun") || darling_if_starts_with(host, "tap")
++			|| darling_if_starts_with(host, "wg") || darling_if_starts_with(host, "utun")
++			|| darling_if_starts_with(host, "tailscale")) {
++		value = (*utun)++;
++		__simple_sprintf(out, "utun%u", value);
++		return;
++	}
++	value = (*en)++;
++	__simple_sprintf(out, "en%u", value);
++}
++
++// Deterministic MAC for a mapped name: Apple OUI plus three hash bytes. The real NIC keeps
++// its hardware address on the host side.
++static void darling_if_mac(const char* name, unsigned char* mac)
++{
++	unsigned long hash = 2166136261u;
++	const char* p = name;
++
++	if (name[0] == 'l' && name[1] == 'o' && name[2] == '0') {
++		memset(mac, 0, MAC_LENGTH);
++		return;
++	}
++	while (*p) {
++		hash ^= (unsigned char) *p++;
++		hash *= 16777619u;
++	}
++	mac[0] = kDarlingIfOui[0];
++	mac[1] = kDarlingIfOui[1];
++	mac[2] = kDarlingIfOui[2];
++	mac[3] = (unsigned char) (hash >> 8);
++	mac[4] = (unsigned char) (hash >> 16);
++	mac[5] = (unsigned char) (hash >> 24);
++}
++
+ static int do_iflist(void* old, unsigned long* oldlen) {
+ 	// we only do IPv4 addresses for now
+ 	int tmp_sock;
+@@ -103,6 +174,8 @@ static int do_iflist(void* old, unsigned long* oldlen) {
+ 	int status = 0;
+ 	char* old_ptr = old;
+ 	unsigned long total_len = 0;
++	unsigned int en_index = 0, bridge_index = 0, utun_index = 0;
++	char mapped_name[DARLING_IF_NAME_MAX];
  
+ 	if ((status = tmp_sock = sys_socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+ 		goto out;
+@@ -113,7 +186,12 @@ static int do_iflist(void* old, unsigned long* oldlen) {
+ 	for (int i = 0; i < lifc.lifc_len; i += sizeof(struct linux_ifreq)) {
+ 		struct linux_ifreq* curr = &lifc.lifc_req[i / sizeof(struct linux_ifreq)];
+ 		size_t name_len = strnlen(curr->lifr_name, sizeof(curr->lifr_name));
+-		size_t additional_sockaddr_len = name_len + MAC_LENGTH;
++		size_t additional_sockaddr_len;
++		unsigned char mapped_mac[MAC_LENGTH];
++
++		darling_map_ifname(curr->lifr_name, &en_index, &bridge_index, &utun_index, mapped_name);
++		name_len = strnlen(mapped_name, DARLING_IF_NAME_MAX);
++		additional_sockaddr_len = name_len + MAC_LENGTH;
+ 		additional_sockaddr_len = (additional_sockaddr_len <= sizeof(((struct sockaddr_dl*)NULL)->sdl_data)) ? 0 : (additional_sockaddr_len - sizeof(((struct sockaddr_dl*)NULL)->sdl_data));
+ 		size_t ifm_length = sizeof(struct if_msghdr) + round_up_sizeof_u32(sizeof(struct sockaddr_dl) + additional_sockaddr_len);
+ 		size_t ifam_length = sizeof(struct ifa_msghdr) + round_up_sizeof_u32(sizeof(struct sockaddr)) * 3;
+@@ -142,13 +220,21 @@ static int do_iflist(void* old, unsigned long* oldlen) {
+ 			dl->sdl_alen = MAC_LENGTH;
+ 			dl->sdl_slen = 0; // ???
+ 
+-			memcpy(dl->sdl_data, curr->lifr_name, name_len);
++			memcpy(dl->sdl_data, mapped_name, name_len);
+ 
+-			// grab the MAC
 +			/* Interface-list consumers (including Chromium) discard adapters
 +			 * without IFF_UP. Populate actual flags instead of leaving zero.
 +			 * The low ten flags share values; Linux multicast differs. */
-+			memcpy(tmp.lifr_name, curr->lifr_name, sizeof(curr->lifr_name));
+ 			memcpy(tmp.lifr_name, curr->lifr_name, sizeof(curr->lifr_name));
+-			if ((status = __real_ioctl(tmp_sock, LINUX_SIOCGIFHWADDR, &tmp)) < 0)
 +			if ((status = __real_ioctl(tmp_sock, LINUX_SIOCGIFFLAGS, &tmp)) < 0)
-+				goto out;
+ 				goto out;
+-			memcpy(LLADDR(dl), tmp.lifr_hwaddr.sa_data, MAC_LENGTH);
 +			unsigned short linux_flags = (unsigned short)tmp.lifr_flags;
 +			ifm->ifm_flags = linux_flags & 0x03ff;
 +			if (linux_flags & 0x1000) ifm->ifm_flags |= IFF_MULTICAST;
 +
- 			// grab the MAC
- 			memcpy(tmp.lifr_name, curr->lifr_name, sizeof(curr->lifr_name));
- 			if ((status = __real_ioctl(tmp_sock, LINUX_SIOCGIFHWADDR, &tmp)) < 0)
++			// report the synthesized MAC for the mapped name
++			darling_if_mac(mapped_name, mapped_mac);
++			memcpy(LLADDR(dl), mapped_mac, MAC_LENGTH);
+ 
+ 			old_ptr += ifm_length;
+ 		}
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_sysctl.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_sysctl.c
 index 5a49882..5dc5fa7 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/helper/misc/sysctl_sysctl.c
@@ -3303,10 +3940,180 @@ index 0000000..479294a
 +	return -ENOSYS;
 +}
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/proc_info.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/proc_info.c
-index c2f70fb..af904ed 100644
+index c2f70fb..138d607 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/proc_info.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/proc_info.c
-@@ -83,6 +83,38 @@ long sys_proc_info(uint32_t callnum, int32_t pid, uint32_t flavor,
+@@ -44,6 +44,169 @@ extern char *strncpy(char *dest, const char *src, __SIZE_TYPE__ n);
+ extern int strncmp (const char * str1, const char * str2, __SIZE_TYPE__ num);
+ extern char *strchr(char *str, int character);
+ 
++
++/* darling-lol: a guest with no process list is not a Mac. Report a small,
++ * coherent set of system processes plus the running application instead of
++ * failing the call. The names match what these daemons are called on macOS
++ * so name scans see a normal machine; proc_pidinfo answers for these pids. */
++struct fake_proc {
++	int32_t pid;
++	const char* name;
++	const char* path;
++};
++
++static const struct fake_proc fake_procs[] = {
++	{   1, "launchd", "/sbin/launchd" },
++	{  55, "logd", "/usr/libexec/logd" },
++	{  57, "UserEventAgent", "/usr/libexec/UserEventAgent" },
++	{  60, "configd", "/usr/libexec/configd" },
++	{  62, "powerd", "/usr/libexec/powerd" },
++	{ 103, "mds", "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Support/mds" },
++	{ 104, "mds_stores", "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds_stores" },
++	{ 145, "WindowServer", "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/WindowServer" },
++	{ 146, "loginwindow", "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow" },
++	{ 150, "distnoted", "/usr/sbin/distnoted" },
++	{ 151, "cfprefsd", "/usr/sbin/cfprefsd" },
++	{ 152, "opendirectoryd", "/usr/libexec/opendirectoryd" },
++	{ 153, "securityd", "/usr/sbin/securityd" },
++	{ 154, "notifyd", "/usr/sbin/notifyd" },
++	{ 155, "syslogd", "/usr/sbin/syslogd" },
++	{ 156, "coreaudiod", "/usr/sbin/coreaudiod" },
++	{ 157, "diskarbitrationd", "/usr/libexec/diskarbitrationd" },
++	{ 158, "nsurlsessiond", "/usr/libexec/nsurlsessiond" },
++	{ 159, "trustd", "/usr/libexec/trustd" },
++	{ 160, "tccd", "/System/Library/PrivateFrameworks/TCC.framework/Resources/tccd" },
++	{ 300, "Dock", "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock" },
++	{ 301, "Finder", "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder" },
++	{ 302, "SystemUIServer", "/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer" },
++};
++
++#define FAKE_PROC_COUNT ((int) (sizeof(fake_procs) / sizeof(fake_procs[0])))
++
++static const struct fake_proc* fake_proc_find(int32_t pid)
++{
++	for (int i = 0; i < FAKE_PROC_COUNT; i++)
++		if (fake_procs[i].pid == pid)
++			return &fake_procs[i];
++	return 0;
++}
++
++static void copy_string(char* dst, const char* src, int size)
++{
++	int i = 0;
++	if (size <= 0)
++		return;
++	while (src[i] && i < size - 1) {
++		dst[i] = src[i];
++		i++;
++	}
++	dst[i] = 0;
++}
++
++/* The application's own name: basename of argv[0] as the loader left it. */
++static void fake_proc_self_name(char* out, int size)
++{
++	char buffer[512];
++	int fd = (int) LINUX_SYSCALL(__NR_open, (long) "/proc/self/cmdline", 0, 0);
++	long got = 0;
++	out[0] = 0;
++	if (fd < 0)
++		return;
++	got = LINUX_SYSCALL(__NR_read, fd, (long) buffer, (long) sizeof(buffer) - 1);
++	LINUX_SYSCALL(__NR_close, fd);
++	if (got <= 0)
++		return;
++	buffer[got] = 0;
++	const char* base = buffer;
++	for (long i = 0; i < got; i++) {
++		if (buffer[i] == '/')
++			base = buffer + i + 1;
++		if (!buffer[i])
++			break;
++	}
++	copy_string(out, base, size);
++}
++
++static int fake_proc_is(int32_t pid)
++{
++	return pid > 0 && pid == (int32_t) LINUX_SYSCALL(__NR_getpid, 0, 0, 0, 0, 0);
++}
++
++/* A synthetic pid can collide with a real guest process (the namespace numbers
++ * from 1, launchd reaps its children through proc_pidinfo). Real processes, the
++ * caller included, always get their real answer. */
++static int real_proc_exists(int32_t pid)
++{
++	char path[32];
++	__simple_sprintf(path, "/proc/%d", pid);
++	return LINUX_SYSCALL(__NR_access, (long) path, 0) == 0;
++}
++
++static long fake_pidinfo(int32_t pid, uint32_t flavor, void* buffer, int32_t bufsize)
++{
++	const struct fake_proc* entry = fake_proc_find(pid);
++	char self_name[32];
++	if (!entry && fake_proc_is(pid)) {
++		fake_proc_self_name(self_name, sizeof(self_name));
++		if (!self_name[0])
++			copy_string(self_name, "LeagueClientUx", sizeof(self_name));
++	}
++
++	if (!buffer)
++		return -EFAULT;
++
++	switch (flavor) {
++	case PROC_PIDTBSDINFO: {
++		struct proc_bsdinfo* info = (struct proc_bsdinfo*) buffer;
++		if (bufsize < (int32_t) sizeof(*info))
++			return -ENOSPC;
++		memset(info, 0, sizeof(*info));
++		info->pbi_flags = 2; /* 64-bit */
++		info->pbi_status = 2; /* SRUN */
++		info->pbi_pid = (uint32_t) pid;
++		info->pbi_ppid = 1;
++		info->pbi_uid = info->pbi_ruid = info->pbi_svuid = 501;
++		info->pbi_gid = info->pbi_rgid = info->pbi_svgid = 20;
++		info->pbi_pgid = (uint32_t) pid;
++		info->pbi_nfiles = 24;
++		info->pbi_start_tvsec = 1729000000;
++		copy_string(info->pbi_comm, entry ? entry->name : self_name, sizeof(info->pbi_comm));
++		copy_string(info->pbi_name, entry ? entry->name : self_name, sizeof(info->pbi_name));
++		return (long) sizeof(*info);
++	}
++	case PROC_PIDT_SHORTBSDINFO: {
++		struct proc_bsdshortinfo* info = (struct proc_bsdshortinfo*) buffer;
++		if (bufsize < (int32_t) sizeof(*info))
++			return -ENOSPC;
++		memset(info, 0, sizeof(*info));
++		info->pbsi_pid = (uint32_t) pid;
++		info->pbsi_ppid = 1;
++		info->pbsi_pgid = (uint32_t) pid;
++		info->pbsi_status = 2;
++		info->pbsi_flags = 2;
++		info->pbsi_uid = info->pbsi_ruid = info->pbsi_svuid = 501;
++		info->pbsi_gid = info->pbsi_rgid = info->pbsi_svgid = 20;
++		copy_string(info->pbsi_comm, entry ? entry->name : self_name, sizeof(info->pbsi_comm));
++		return (long) sizeof(*info);
++	}
++	case PROC_PIDPATHINFO:
++		copy_string((char*) buffer, entry ? entry->path : "/Applications/League of Legends.app/Contents/LoL/LeagueClient.app/Contents/MacOS/LeagueClient", bufsize);
++		return (long) strlen((char*) buffer) + 1;
++	case PROC_PIDTASKINFO: {
++		struct proc_taskinfo* info = (struct proc_taskinfo*) buffer;
++		if (bufsize < (int32_t) sizeof(*info))
++			return -ENOSPC;
++		memset(info, 0, sizeof(*info));
++		info->pti_threadnum = 1;
++		info->pti_resident_size = 8u * 1024u * 1024u;
++		info->pti_virtual_size = 64u * 1024u * 1024u;
++		return (long) sizeof(*info);
++	}
++	default:
++		return -ENOTSUP;
++	}
++}
++
+ long sys_proc_info(uint32_t callnum, int32_t pid, uint32_t flavor,
+ 		uint64_t arg, void* buffer, int32_t bufsize)
+ {
+@@ -83,7 +246,54 @@ long sys_proc_info(uint32_t callnum, int32_t pid, uint32_t flavor,
  		case 2: // proc_pidinfo
  			return _proc_pidinfo(pid, flavor, arg, buffer, bufsize);
  		case 3: // proc_pidfdinfo
@@ -3343,8 +4150,34 @@ index c2f70fb..af904ed 100644
 +			return -ENOTSUP;
 +		}
  		case 1: // proc_listpids
++		{
++			int32_t* out = (int32_t*) buffer;
++			int count = 0;
++			int cap = bufsize / (int32_t) sizeof(int32_t);
++			int32_t self = (int32_t) LINUX_SYSCALL(__NR_getpid, 0, 0, 0, 0, 0);
++
++			if (buffer == NULL)
++				return (FAKE_PROC_COUNT + 1) * (int32_t) sizeof(int32_t);
++
++			for (int i = 0; i < FAKE_PROC_COUNT && count < cap; i++)
++				out[count++] = fake_procs[i].pid;
++			if (count < cap)
++				out[count++] = self;
++			return count * (int32_t) sizeof(int32_t);
++		}
  		default:
  			__simple_printf("sys_proc_info(): Unsupported callnum: %d\n",
+ 					callnum);
+@@ -115,6 +325,9 @@ static long _proc_pidinfo_listthreads(int32_t pid, void* buffer, int32_t bufsize
+ 
+ long _proc_pidinfo(int32_t pid, uint32_t flavor, uint64_t arg, void* buffer, int32_t bufsize)
+ {
++	if (fake_proc_find(pid) != 0 && !fake_proc_is(pid) && !real_proc_exists(pid))
++		return fake_pidinfo(pid, flavor, buffer, bufsize);
++
+ 	switch (flavor)
+ 	{
+ 		// arg is a memory location we want to know about
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/ptrace.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/ptrace.c
 index 0a8f1e4..a19f12e 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/ptrace.c
@@ -3377,10 +4210,22 @@ index 0a8f1e4..a19f12e 100644
  
  	if (cmd != NULL)
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/sysctl.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/sysctl.c
-index 10f39a5..29747d4 100644
+index 10f39a5..0e380b6 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/sysctl.c
 +++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/misc/sysctl.c
-@@ -42,11 +42,15 @@ const struct known_sysctl sysctls_root = {
+@@ -1,4 +1,11 @@
+ #include <darling/emulation/xnu_syscall/bsd/impl/misc/sysctl.h>
++#include <darling/emulation/xnu_syscall/bsd/impl/fcntl/open.h>
++#include <darling/emulation/xnu_syscall/bsd/impl/unistd/write.h>
++#include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
++#include <darling/emulation/common/simple.h>
++#include <darling/emulation/conversion/fcntl/open.h>
++#include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
++
+ 
+ #include <sys/errno.h>
+ #include <stddef.h>
+@@ -42,16 +49,62 @@ const struct known_sysctl sysctls_root = {
  
  void copyout_string(const char* str, char* out, unsigned long* out_len)
  {
@@ -3400,17 +4245,81 @@ index 10f39a5..29747d4 100644
  
  	if (out_len != NULL)
  		*out_len = len;
-@@ -130,7 +134,10 @@ long sys_sysctlbyname(const char* name, unsigned long namelen, void* old, unsign
+ }
+ 
++
++// darling-lol: DARLING_SYSCTL_TRACE=1 records every name-based sysctl lookup with the
++// requesting pid into /tmp/sysctl-trace.log (the guest's /tmp). It answers which keys a
++// client actually reads instead of guessing from disassembly.
++extern char* getenv(const char* name);
++
++static void sysctl_trace(const char* name, long result)
++{
++	static int enabled = -1;
++	char buffer[320];
++	char body[192];
++	int fd;
++
++	if (enabled < 0) {
++		const char* value = getenv("DARLING_SYSCTL_TRACE");
++		enabled = value != NULL && value[0] != '\0' && value[0] != '0';
++	}
++	if (!enabled)
++		return;
++
++	fd = sys_open_nocancel("/tmp/sysctl-trace.log", BSD_O_WRONLY | BSD_O_CREAT | BSD_O_APPEND, 0644);
++	if (fd < 0)
++		return;
++
++	struct { long seconds; long microseconds; } now = { 0, 0 };
++	LINUX_SYSCALL2(__NR_gettimeofday, &now, 0);
++	__simple_sprintf(body, "%ld pid=%d result=%ld ",
++			now.seconds, (int) LINUX_SYSCALL0(__NR_getpid), result);
++	int body_len = 0;
++	while (body[body_len] != '\0')
++		body_len++;
++	int len = body_len < (int) sizeof(body) ? body_len : (int) sizeof(body);
++	int pos = 0;
++	for (int i = 0; i < len; i++)
++		buffer[pos++] = body[i];
++	for (const char* p = name; *p != '\0' && pos < (int) sizeof(buffer) - 2; p++)
++		buffer[pos++] = *p;
++	buffer[pos++] = '\n';
++	sys_write(fd, buffer, pos);
++	close_internal(fd);
++}
++
+ long sys_sysctl(int* name, unsigned int nlen, void* old,
+ 		unsigned long* oldlen, void* _new, unsigned long newlen)
+ {
+@@ -130,7 +183,11 @@ long sys_sysctlbyname(const char* name, unsigned long namelen, void* old, unsign
  		}
  
  		if (next == NULL)
 +		{
 +			__simple_kprintf("sysctlbyname: unknown name %s", name);
++			sysctl_trace(name, -ENOENT);
  			return -ENOENT;
 +		}
  
  		current = next;
  		token = strtok_r(NULL, ".", &saveptr);
+@@ -139,5 +196,14 @@ long sys_sysctlbyname(const char* name, unsigned long namelen, void* old, unsign
+ 	if (current->type == CTLTYPE_NODE)
+ 		return -EISDIR;
+ 
+-	return current->handler(NULL, 0, old, oldlen, _new, newlen);
++	// darling-lol: offline experiment switch. Naming a lookup in DARLING_TEST_BREAK makes
++	// that one key answer ENOENT, so a client's reaction to a missing check can be observed
++	// inside a network namespace without reporting anything to a server.
++	const char* test_break = getenv("DARLING_TEST_BREAK");
++	if (test_break != NULL && strcmp(test_break, name) == 0)
++		return -ENOENT;
++
++	long result = current->handler(NULL, 0, old, oldlen, _new, newlen);
++	sysctl_trace(name, result);
++	return result;
+ }
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/mman/madvise.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/mman/madvise.c
 index 10c412b..adb7e24 100644
 --- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/mman/madvise.c
@@ -4334,6 +5243,164 @@ index 1098510..1741d5a 100644
 +	    buf->f_fstypename, sizeof(buf->f_fstypename),
 +	    buf->f_mntfromname, sizeof(buf->f_mntfromname));
  	return 0;
+ }
+diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/stat/getfsstat.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/stat/getfsstat.c
+index d1cdd3d..9a99b2d 100644
+--- a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/stat/getfsstat.c
++++ b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/stat/getfsstat.c
+@@ -14,6 +14,58 @@
+ extern char *strtok_r(char *str, const char *delim, char **saveptr);
+ extern unsigned long strlcpy(char* dst, const char* src, unsigned long size);
+ 
++
++/* darling-lol: the guest must not see the Linux mount table. A real Mac
++ * reports a handful of APFS volumes; /proc/self/mounts gives dozens of
++ * host filesystems (btrfs, overlay, tmpfs, cgroup, /proc, /sys). Filter
++ * them out and report the root as an APFS volume. */
++static int hidden_fs(const char* source, const char* mount, const char* type)
++{
++	static const char* const types[] = {
++		"btrfs", "ext2", "ext3", "ext4", "xfs", "f2fs", "zfs", "overlay",
++		"tmpfs", "ramfs", "proc", "sysfs", "devtmpfs", "devpts", "cgroup",
++		"cgroup2", "mqueue", "nsfs", "bpf", "tracefs", "debugfs",
++		"securityfs", "pstore", "configfs", "hugetlbfs", "fusectl",
++		"binfmt_misc", "efivarfs", "autofs", "rpc_pipefs", "sunrpc",
++		"fuse", "fuse.portal", "nfsd", "9p", "vfat", "exfat", "ntfs",
++		"ntfs3", "fuseblk", "squashfs", "iso9660", "udf", "cifs", "smb3",
++		"nfs", "nfs4", 0
++	};
++	static const char* const paths[] = {
++		"/proc", "/sys", "/dev/pts", "/dev/shm", "/dev/mqueue", "/run",
++		"/tmp", "/var/lib", "/snap", "/media", "/mnt", "/Volumes/SystemRoot", 0
++	};
++	for (int i = 0; types[i]; i++) {
++		const char* a = types[i]; const char* b = type;
++		while (*a && *a == *b) { a++; b++; }
++		if (!*a && !*b) return 1;
++	}
++	/* fuse subclasses (fuse.rclone, fuse.portal) and other FUSE names. */
++	{
++		const char* prefix = "fuse";
++		const char* a = prefix; const char* b = type;
++		while (*a && *a == *b) { a++; b++; }
++		if (!*a) return 1;
++	}
++	/* AppImage and other loop mounts. */
++	{
++		const char* a = "/dev/loop"; const char* b = source;
++		while (*a && *a == *b) { a++; b++; }
++		if (!*a) return 1;
++	}
++	for (int i = 0; paths[i]; i++) {
++		const char* a = paths[i]; const char* b = mount;
++		while (*a && *a == *b) { a++; b++; }
++		if (!*a) return 1;
++	}
++	return 0;
++}
++
++static int root_mount(const char* mount)
++{
++	return mount[0] == '/' && mount[1] == '\0';
++}
++
+ long sys_getfsstat(struct bsd_statfs* buf, int bufsize, int flags)
+ {
+ #ifdef __x86_64__
+@@ -43,28 +95,42 @@ long sys_getfsstat64(struct bsd_statfs64* buf, int bufsize, int flags)
+ 		char* saveptr;
+ 		struct linux_statfs64 lbuf;
+ 
+-		if (buf != NULL)
+ 		{
+-			if (bufsize < sizeof(struct bsd_statfs64) * (count+1))
+-				break;
++			char* source;
++			char* mount;
++			char* type;
++			int skip;
+ 
+-			p = strtok_r(line, " ", &saveptr);
+-			if (p == NULL)
++			source = strtok_r(line, " ", &saveptr);
++			if (source == NULL)
+ 				continue;
+-
+-			strlcpy(buf[count].f_mntfromname, p, sizeof(buf[count].f_mntfromname));
+-
+-			p = strtok_r(NULL, " ", &saveptr);
+-			if (p == NULL)
++			mount = strtok_r(NULL, " ", &saveptr);
++			if (mount == NULL)
++				continue;
++			type = strtok_r(NULL, " ", &saveptr);
++			if (type == NULL)
+ 				continue;
+ 
+-			strlcpy(buf[count].f_mntonname, p, sizeof(buf[count].f_mntonname));
+-
+-			p = strtok_r(NULL, " ", &saveptr);
+-			if (p == NULL)
++			/* The root volume is always kept; it is renamed to APFS below. */
++			skip = hidden_fs(source, mount, type) && !root_mount(mount);
++			if (buf != NULL)
++			{
++				if (bufsize < sizeof(struct bsd_statfs64) * (count+1))
++					break;
++			}
++			if (skip)
+ 				continue;
+ 
+-			strlcpy(buf[count].f_fstypename, p, sizeof(buf[count].f_fstypename));
++			if (buf != NULL)
++			{
++				if (root_mount(mount)) {
++					strlcpy(buf[count].f_mntfromname, "/dev/disk3s1s1", sizeof(buf[count].f_mntfromname));
++					strlcpy(buf[count].f_fstypename, "apfs", sizeof(buf[count].f_fstypename));
++				} else {
++					strlcpy(buf[count].f_mntfromname, source, sizeof(buf[count].f_mntfromname));
++					strlcpy(buf[count].f_fstypename, type, sizeof(buf[count].f_fstypename));
++				}
++				strlcpy(buf[count].f_mntonname, mount, sizeof(buf[count].f_mntonname));
+ 
+ #ifdef __NR_statfs64
+ 			if (LINUX_SYSCALL2(__NR_statfs64, (char*)buf[count].f_mntonname, &lbuf) < 0)
+@@ -74,11 +140,36 @@ long sys_getfsstat64(struct bsd_statfs64* buf, int bufsize, int flags)
+ 				continue;
+ 
+ 			statfs_linux_to_bsd64(&lbuf, &buf[count]);
++			}
+ 		}
+ 
+ 		count++;
+ 	}
+ 
+ 	close_internal(fd);
++
++	/* Every Mac lists the APFS system volumes besides the root. */
++	{
++		static const char* const extra_source[] = { "/dev/disk3s5", "/dev/disk3s6", "/dev/disk3s2", 0 };
++		static const char* const extra_mount[] = { "/System/Volumes/Data", "/System/Volumes/VM", "/System/Volumes/Preboot", 0 };
++
++		if (buf == NULL) {
++			for (int i = 0; extra_mount[i]; i++) count++;
++		} else {
++			int root = -1;
++			for (int i = 0; i < count; i++)
++				if (root_mount(buf[i].f_mntonname)) { root = i; break; }
++			for (int i = 0; extra_mount[i] && root >= 0; i++) {
++				if (bufsize < (int) (sizeof(struct bsd_statfs64) * (count + 1)))
++					break;
++				buf[count] = buf[root];
++				strlcpy(buf[count].f_mntfromname, extra_source[i], sizeof(buf[count].f_mntfromname));
++				strlcpy(buf[count].f_mntonname, extra_mount[i], sizeof(buf[count].f_mntonname));
++				strlcpy(buf[count].f_fstypename, "apfs", sizeof(buf[count].f_fstypename));
++				count++;
++			}
++		}
++	}
++
+ 	return count;
  }
 diff --git a/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/stat/statfs.c b/darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/stat/statfs.c
 index a6a5162..2155dc4 100644

@@ -1,0 +1,305 @@
+From eea7786322e16f38042607c5eccc93d86c48019d Mon Sep 17 00:00:00 2001
+From: Andras Laszlo <laszlo2002andras@gmail.com>
+Date: Sat, 17 Oct 2026 14:52:59 +0200
+Subject: [PATCH] fix(anti-cheat,telemetry): resolve Metal GPU spoofing and
+ provision system root certificates
+
+---
+ patches/metal.patch                       | 96 +++++++++++++++++++----
+ tools/build-riot-metal-runtime.py         |  2 +-
+ tools/ensure-darling-root-certificates.py | 68 ++++++++++++++++
+ tools/install-riot-gpu-runtime.sh         |  1 +
+ tools/run-riot-client.sh                  |  1 +
+ 5 files changed, 153 insertions(+), 15 deletions(-)
+ create mode 100644 tools/ensure-darling-root-certificates.py
+
+diff --git a/patches/metal.patch b/patches/metal.patch
+index d529851..9056c5e 100644
+--- a/patches/metal.patch
++++ b/patches/metal.patch
+@@ -1123,10 +1123,10 @@ index 2a57796..0cbedf2 100644
+ -
+  @end
+ diff --git a/src/Metal/MTLDevice.mm b/src/Metal/MTLDevice.mm
+-index f58184a..6cfc697 100644
++index f58184a..d78ffe7 100644
+ --- a/src/Metal/MTLDevice.mm
+ +++ b/src/Metal/MTLDevice.mm
+-@@ -2,13 +2,26 @@
++@@ -2,14 +2,28 @@
+  // SPDX-License-Identifier: MPL-2.0
+  
+  #import <Metal/MTLDeviceInternal.h>
+@@ -1151,9 +1151,11 @@ index f58184a..6cfc697 100644
+ +#import <Metal/MTLVertexDescriptor.h>
+ +#include <type_traits>
+  #import <Metal/MTLRenderPipelineInternal.h>
+++#include <indium/device.private.hpp>
+  
+  MTL_EXTERN const MTLDeviceNotificationName MTLDeviceWasAddedNotification = @"MTLDeviceWasAdded";
+-@@ -88,6 +101,37 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++ MTL_EXTERN const MTLDeviceNotificationName MTLDeviceRemovalRequestedNotification = @"MTLDeviceRemovalRequested";
++@@ -88,6 +102,37 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  	[observer release];
+  };
+  
+@@ -1191,7 +1193,7 @@ index f58184a..6cfc697 100644
+  @implementation MTLDeviceInternal
+  
+  #if DARLING_METAL_ENABLED
+-@@ -153,12 +197,46 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -153,12 +198,112 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  	[_threadExitCondition unlock];
+  }
+  
+@@ -1205,16 +1207,82 @@ index f58184a..6cfc697 100644
+ +	return MTLReadWriteTextureTier2;
+ +}
+ +
+++static NSString* sanitizeGpuName(std::string rawName) {
+++	const char* envOverride = getenv("DARLING_METAL_GPU_NAME");
+++	if (envOverride && envOverride[0] != '\0') {
+++		return [NSString stringWithUTF8String:envOverride];
+++	}
+++
+++	// Strip driver annotations like " (RADV NAVI21)", " (LLVM ...)", etc.
+++	size_t paren = rawName.find('(');
+++	if (paren != std::string::npos) {
+++		rawName = rawName.substr(0, paren);
+++	}
+++	while (!rawName.empty() && isspace((unsigned char)rawName.back())) {
+++		rawName.pop_back();
+++	}
+++
+++	// If string is empty or contains forbidden emulator strings:
+++	if (rawName.empty() ||
+++	    rawName.find("Darling") != std::string::npos ||
+++	    rawName.find("Indium") != std::string::npos ||
+++	    rawName.find("llvmpipe") != std::string::npos ||
+++	    rawName.find("softpipe") != std::string::npos) {
+++		return @"AMD Radeon Pro 5500M";
+++	}
+++
+++	// Mac Metal officially supports AMD, Apple Silicon, and Intel.
+++	// If the GPU is NVIDIA (unsupported on macOS Big Sur+) or something non-Mac:
+++	if (rawName.find("NVIDIA") != std::string::npos ||
+++	    rawName.find("GeForce") != std::string::npos ||
+++	    rawName.find("Intel Arc") != std::string::npos) {
+++		return @"AMD Radeon Pro 5700 XT";
+++	}
+++
+++	return [NSString stringWithUTF8String:rawName.c_str()];
+++}
+++
+ +/* darling-lol M57: feature queries ANGLE's Metal backend needs. */
+ +- (BOOL)isDepth24Stencil8PixelFormatSupported { return _device->supportsDepth24Stencil8PixelFormat(); }
+-+- (BOOL)hasUnifiedMemory { return YES; }
+-+- (NSUInteger)maxBufferLength { return 256u * 1024u * 1024u; }
+-+- (NSUInteger)recommendedMaxWorkingSetSize { return 1ull << 30; }
+++- (BOOL)hasUnifiedMemory
+++{
+++	auto priv = dynamic_cast<Indium::PrivateDevice*>(_device.get());
+++	if (priv) {
+++		return priv->properties().deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+++	}
+++	return NO;
+++}
+++- (NSUInteger)recommendedMaxWorkingSetSize
+++{
+++	const char* envVram = getenv("DARLING_METAL_VRAM_MB");
+++	if (envVram && envVram[0] != '\0') {
+++		unsigned long long mb = strtoull(envVram, NULL, 10);
+++		if (mb > 0) return mb * 1024ull * 1024ull;
+++	}
+++
+++	auto priv = dynamic_cast<Indium::PrivateDevice*>(_device.get());
+++	if (priv) {
+++		uint64_t vram = 0;
+++		const auto& mem = priv->memoryProperties();
+++		for (uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+++			if (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+++				vram += mem.memoryHeaps[i].size;
+++			}
+++		}
+++		if (vram > 0) return vram;
+++	}
+++	return 4ull << 30;
+++}
+++- (NSUInteger)maxBufferLength
+++{
+++	NSUInteger vram = [self recommendedMaxWorkingSetSize];
+++	return vram > (1ull << 30) ? (1ull << 30) : vram;
+++}
+ +- (BOOL)isLowPower { return NO; }
+ +- (BOOL)isRemovable { return NO; }
+ +- (BOOL)isHeadless { return NO; }
+-+- (NSString*)name { return @"Darling Indium Device"; }
+-+- (uint64_t)registryID { return 0; }
+++- (NSString*)name { return sanitizeGpuName(_device ? _device->name() : ""); }
+++- (uint64_t)registryID { return 0x10000028bull; }
+ +- (BOOL)supportsFamily: (NSUInteger)family { return YES; }
+ +- (BOOL)supportsFeatureSet: (NSUInteger)featureSet { return YES; }
+ +- (BOOL)supportsTextureSampleCount: (NSUInteger)sampleCount { return sampleCount <= 4; }
+@@ -1239,7 +1307,7 @@ index f58184a..6cfc697 100644
+  	if (!pso) {
+  		if (error) {
+  			// TODO: better error and/or match what the official Metal method does
+-@@ -166,6 +244,7 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -166,6 +311,7 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  		}
+  		return nil;
+  	}
+@@ -1247,7 +1315,7 @@ index f58184a..6cfc697 100644
+  	return [[MTLComputePipelineStateInternal alloc] initWithState: pso device: self label: descriptor.label];
+  }
+  
+-@@ -183,7 +262,13 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -183,7 +329,13 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+                                                          reflection: (MTLAutoreleasedComputePipelineReflection*)reflection 
+                                                               error: (NSError**)error
+  {
+@@ -1262,7 +1330,7 @@ index f58184a..6cfc697 100644
+  	if (!pso) {
+  		if (error) {
+  			// TODO: better error and/or match what the official Metal method does
+-@@ -191,13 +276,44 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -191,13 +343,44 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  		}
+  		return nil;
+  	}
+@@ -1308,7 +1376,7 @@ index f58184a..6cfc697 100644
+  	if (!pso) {
+  		if (error) {
+  			// TODO: better error and/or match what the official Metal method does
+-@@ -205,7 +321,114 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -205,7 +388,114 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  		}
+  		return nil;
+  	}
+@@ -1424,7 +1492,7 @@ index f58184a..6cfc697 100644
+  }
+  
+  - (id<MTLCommandQueue>)newCommandQueue
+-@@ -275,8 +498,21 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
++@@ -275,8 +565,21 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
+  - (id<MTLLibrary>)newLibraryWithData: (dispatch_data_t)data
+                                 error: (NSError**)error
+  {
+diff --git a/tools/build-riot-metal-runtime.py b/tools/build-riot-metal-runtime.py
+index 415bf4a..d26bfba 100644
+--- a/tools/build-riot-metal-runtime.py
++++ b/tools/build-riot-metal-runtime.py
+@@ -13,6 +13,7 @@
+         flags[key] = shlex.split(value)
+ resource_include = subprocess.check_output(['clang++', '-print-resource-dir'], text=True).strip() + '/include'
+ flags['CXX_INCLUDES'] = [resource_include if value.startswith('/usr/lib/clang/') and value.endswith('/include') else value for value in flags['CXX_INCLUDES']]
++flags['CXX_INCLUDES'].append('-I' + str(root / 'build/darling-src/src/external/metal/deps/indium/private-include'))
+ link = shlex.split((folder / 'CMakeFiles/Metal.dir/link.txt').read_text())
+ # These objects passed live League validation. Keep the broader resource/queue
+ # optimization experiment out of the default build after fresh-match stalls.
+@@ -28,7 +29,6 @@
+         link.append(str(obj))
+ link[link.index('-o') + 1] = str(root / 'build/riot-Metal')
+ subprocess.run(link, cwd=folder, check=True)
+-flags['CXX_INCLUDES'].append('-I' + str(root / 'build/darling-src/src/external/metal/deps/indium/private-include'))
+ obj = root / 'build/riot-metal-sampler-check.o'
+ subprocess.run(['clang++', *flags['CXX_DEFINES'], *flags['CXX_INCLUDES'],
+                 *flags['CXX_FLAGS'], '-c', str(root / 'tools/riot-metal-sampler-check.mm'),
+diff --git a/tools/ensure-darling-root-certificates.py b/tools/ensure-darling-root-certificates.py
+new file mode 100644
+index 0000000..6aa77f4
+--- /dev/null
++++ b/tools/ensure-darling-root-certificates.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++"""Ensure system root certificates and SystemTrustSettings.plist exist in Darling."""
++import datetime
++import hashlib
++import os
++from pathlib import Path
++import plistlib
++import shutil
++import ssl
++import subprocess
++
++prefix = Path(os.environ.get("DPREFIX", str(Path.home() / ".darling")))
++keychains_dir = prefix / "System/Library/Keychains"
++root_kc = keychains_dir / "SystemRootCertificates.keychain"
++plist_path = keychains_dir / "SystemTrustSettings.plist"
++
++if root_kc.is_file() and plist_path.is_file():
++    exit(0)
++
++keychains_dir.mkdir(parents=True, exist_ok=True)
++
++if root_kc.exists():
++    root_kc.unlink()
++
++try:
++    subprocess.run(["darling", "shell", "security", "create-keychain", "-p", "",
++                    "/System/Library/Keychains/SystemRootCertificates.keychain"], check=True)
++except Exception as e:
++    print(f"Warning: Failed to create root keychain: {e}")
++    exit(0)
++
++ctx = ssl.create_default_context()
++der_certs = ctx.get_ca_certs(binary_form=True)
++
++tmp_certs_dir = Path("/tmp/darling_root_certs")
++if tmp_certs_dir.exists():
++    shutil.rmtree(tmp_certs_dir)
++tmp_certs_dir.mkdir(parents=True)
++
++now = datetime.datetime.now(datetime.timezone.utc)
++trust_list = {}
++
++for idx, der in enumerate(der_certs):
++    cert_file = tmp_certs_dir / f"cert_{idx}.der"
++    cert_file.write_bytes(der)
++    sha1_hex = hashlib.sha1(der).hexdigest().upper()
++    trust_list[sha1_hex] = {
++        "issuerName": b"Apple Root CA",
++        "serialNumber": b"\x01",
++        "modDate": now,
++    }
++
++cert_files = [f"/Volumes/SystemRoot{tmp_certs_dir / f'cert_{i}.der'}" for i in range(len(der_certs))]
++for chunk_start in range(0, len(cert_files), 50):
++    chunk = cert_files[chunk_start:chunk_start + 50]
++    subprocess.run(["darling", "shell", "security", "add-certificates", "-k",
++                    "/System/Library/Keychains/SystemRootCertificates.keychain", *chunk], check=True)
++
++shutil.rmtree(tmp_certs_dir, ignore_errors=True)
++
++plist_data = {
++    "trustVersion": 1,
++    "trustList": trust_list
++}
++with open(plist_path, "wb") as f:
++    plistlib.dump(plist_data, f, fmt=plistlib.FMT_XML)
++
++print(f"Provisioned Darling system root certificates ({len(trust_list)} roots)")
+diff --git a/tools/install-riot-gpu-runtime.sh b/tools/install-riot-gpu-runtime.sh
+index 68f887f..5b0da18 100755
+--- a/tools/install-riot-gpu-runtime.sh
++++ b/tools/install-riot-gpu-runtime.sh
+@@ -28,6 +28,7 @@ python3 tools/build-riot-cxxabi-runtime.py
+ python3 tools/build-riot-indium-runtime.py
+ python3 tools/build-riot-metal-runtime.py
+ python3 tools/build-riot-server-runtime.py
++python3 tools/ensure-darling-root-certificates.py
+ build/riot-host-message-check
+ cc -shared -fPIC -O2 -Wall -Wextra -Wl,-soname,"$project_dir/build/libdarling-xshm.so" tools/m58f299-xshm.c -o build/libdarling-xshm.so.next -pthread $(pkg-config --cflags --libs x11 x11-xcb xcb-shm xext)
+ python3 tools/stop-darling-runtime.py
+diff --git a/tools/run-riot-client.sh b/tools/run-riot-client.sh
+index fd29d04..3bb562d 100755
+--- a/tools/run-riot-client.sh
++++ b/tools/run-riot-client.sh
+@@ -10,6 +10,7 @@ fi
+ runner_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ python3 "$runner_dir/ensure-darling-runtime.py"
+ python3 "$runner_dir/ensure-darling-service-accounts.py"
++python3 "$runner_dir/ensure-darling-root-certificates.py"
+ python3 "$runner_dir/ensure-league-runtime-layout.py"
+ # Discard argument-rewriting settings from the former injected shim.
+ unset RCLOL_APP_ARGS RCLOL_APP_ARGS_SLOT RCLOL_APP_ARG2 RCLOL_APP_ARG2_SLOT

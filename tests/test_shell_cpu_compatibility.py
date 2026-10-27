@@ -13,7 +13,8 @@ class ShellCPUChecks(unittest.TestCase):
         original = self.patched('xnu', root + 'include/xnu_syscall/bsd/impl/misc/sysctl.h')
         size_macro = original[original.index('#define sysctl_handle_size'):original.index('typedef long')]
         source = self.patched('xnu', root + 'src/xnu_syscall/bsd/helper/misc/sysctl_hw.c')
-        start = source.index('static long cpu_frequency(')
+        # Both frequency OIDs report the masked i7-9750H clock and read nothing from the host.
+        start = source.index('#define MASKED_CPU_FREQUENCY')
         handler = source[start:source.index('\nsysctl_handler(handle_cpu64bitcapable)', start)]
         self.run_c(header + '''
 #include <assert.h>
@@ -39,9 +40,10 @@ int main(void) {
     length = 4; hz = 17;
     assert(handle_cpufrequency(&hz, &length) == -EINVAL && hz == 17 && reads == 0);
     length = sizeof(hz);
-    assert(handle_cpufrequency(&hz, &length) == 0 && hz == 5600000000ULL && length == 8);
+    assert(handle_cpufrequency(&hz, &length) == 0 && hz == 2600000000ULL && length == 8);
     uint32_t legacy = 0; length = sizeof(legacy);
-    assert(handle_cpufrequency_compat(&legacy, &length) == 0 && length == 4 && legacy == (uint32_t)5600000000ULL);
+    assert(handle_cpufrequency_compat(&legacy, &length) == 0 && length == 4 && legacy == (uint32_t)2600000000ULL);
+    assert(reads == 0);
 }
 ''')
 

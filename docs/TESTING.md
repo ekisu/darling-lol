@@ -23,7 +23,7 @@ c++ -std=c++17 -I build/darling-src/src/external/metal/private-include \
 build/test-metal-device-info
 ```
 
-Expected: `METAL_DEVICE_INFO failures=0 pass=1`. It covers how `MTLDevice.name` turns Vulkan names into macOS style (`AMD Radeon RX 6800 XT (RADV NAVI21)` becomes `AMD Radeon RX 6800 XT`, `Intel(R) UHD Graphics 630 (CML GT2)` becomes `Intel UHD Graphics 630`, NVIDIA names stay as they are), the `DARLING_METAL_VRAM_MB` parser, the working-set sum over Vulkan heaps, and a non-zero `registryID`. `python3 -m unittest tests.test_metal_device_info` runs the same check against the header in `patches/metal.patch`, so it also works without a prepared source tree; CI runs it.
+Expected: `METAL_DEVICE_INFO failures=0 pass=1`. It covers how `MTLDevice.name` turns Vulkan names into macOS style (`AMD Radeon RX 6800 XT (RADV NAVI21)` becomes `AMD Radeon RX 6800 XT`, `Intel(R) UHD Graphics 630 (CML GT2)` becomes `Intel UHD Graphics 630`, NVIDIA names stay as they are, while `DARLING_METAL_MAC_GPU_NAME` maps NVIDIA to the MacBookPro16,1 AMD GPU), the `DARLING_METAL_VRAM_MB` parser, the working-set sum over Vulkan heaps, and a non-zero `registryID`. `python3 -m unittest tests.test_metal_device_info` runs the same check against the header in `patches/metal.patch`, so it also works without a prepared source tree; CI runs it.
 
 The direct-presentation core needs no Darling either:
 
@@ -299,7 +299,7 @@ It prints `PASS` or `FAIL` for seven cases: a drop onto a destination without `p
 python3 build/runtime/tools/build-riot-carboncore-runtime.py
 ```
 
-After installing and activating CarbonCore, run the independent `build/riot-gestalt-version-check` through Darling with the normal framework/library overrides. Expected on the current kernel: `GESTALT_VERSION product=14.7 version=14.7.0 packed=0x1470 architecture=10 pass=1`. It compares the separate version selectors against `kern.osproductversion`, checks packed BCD, confirms architecture remains a separate result, and covers null outputs and unknown selectors. The previous implementation returned 10 for every version component and the packed selector. The probe does not launch or contact Riot. Passing it establishes the API correction, not Vanguard compatibility.
+After installing and activating CarbonCore, run the independent `build/riot-gestalt-version-check` through Darling with the normal framework/library overrides. Expected on the current kernel (macOS 14.6, see [platform identity](PLATFORM_IDENTITY.md#masked-hardware-identity)): `GESTALT_VERSION product=14.6 version=14.6.0 packed=0x1460 architecture=10 pass=1`. It compares the separate version selectors against `kern.osproductversion`, checks packed BCD, confirms architecture remains a separate result, and covers null outputs and unknown selectors. The previous implementation returned 10 for every version component and the packed selector. The probe does not launch or contact Riot. Passing it establishes the API correction, not Vanguard compatibility.
 
 ## Standalone guest probes
 

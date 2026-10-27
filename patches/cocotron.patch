@@ -7352,13 +7352,58 @@ index 99826d19..0b75047b 100644
  {
  	CGSWindow* win = [self windowForId: winId];
 diff --git a/CoreGraphics/CGSWindow.m b/CoreGraphics/CGSWindow.m
-index e1da261d..f050b6e8 100644
+index e1da261d..96aba2a5 100644
 --- a/CoreGraphics/CGSWindow.m
 +++ b/CoreGraphics/CGSWindow.m
-@@ -101,6 +101,47 @@ CGError CGSSetWindowTitle(CGSConnectionID cid, CGSWindowID wid,
+@@ -101,6 +101,100 @@ CGError CGSSetWindowTitle(CGSConnectionID cid, CGSWindowID wid,
      return CGSSetWindowProperty(cid, wid, kCGSWindowTitle, title);
  }
  
++// darling-lol: a Mac always has the desktop, Dock and menu bar windows. The guest's
++// display server reports none, which is not a state macOS can be in and is easy to
++// spot from userspace. Fill a plausible list when the real one is empty.
++static NSDictionary* syntheticWindowInfo(unsigned number, pid_t ownerPid, NSString* ownerName,
++                                         NSString* windowName, int layer, NSDictionary* bounds)
++{
++	return [NSDictionary dictionaryWithObjectsAndKeys:
++		[NSNumber numberWithUnsignedInt: number], (NSString*) kCGWindowNumber,
++		[NSNumber numberWithInt: ownerPid], (NSString*) kCGWindowOwnerPID,
++		ownerName, (NSString*) kCGWindowOwnerName,
++		windowName, (NSString*) kCGWindowName,
++		[NSNumber numberWithInt: layer], (NSString*) kCGWindowLayer,
++		[NSNumber numberWithBool: YES], (NSString*) kCGWindowIsOnscreen,
++		[NSNumber numberWithFloat: 1.0f], (NSString*) kCGWindowAlpha,
++		bounds, (NSString*) kCGWindowBounds,
++		nil];
++}
++
++static NSArray* syntheticWindowList(void)
++{
++	NSString* appName = nil;
++	NSArray* arguments = [[NSProcessInfo processInfo] arguments];
++	if ([arguments count] > 0)
++		appName = [[arguments objectAtIndex: 0] lastPathComponent];
++	if (![appName length])
++		appName = [[NSProcessInfo processInfo] processName];
++
++	NSDictionary* fullScreen = [NSDictionary dictionaryWithObjectsAndKeys:
++		[NSNumber numberWithInt: 0], @"X", [NSNumber numberWithInt: 0], @"Y",
++		[NSNumber numberWithInt: 1920], @"Width", [NSNumber numberWithInt: 1080], @"Height", nil];
++	NSDictionary* menuBar = [NSDictionary dictionaryWithObjectsAndKeys:
++		[NSNumber numberWithInt: 0], @"X", [NSNumber numberWithInt: 0], @"Y",
++		[NSNumber numberWithInt: 1920], @"Width", [NSNumber numberWithInt: 24], @"Height", nil];
++	NSDictionary* dock = [NSDictionary dictionaryWithObjectsAndKeys:
++		[NSNumber numberWithInt: 0], @"X", [NSNumber numberWithInt: 1020], @"Y",
++		[NSNumber numberWithInt: 1920], @"Width", [NSNumber numberWithInt: 60], @"Height", nil];
++
++	NSMutableArray* windows = [[NSMutableArray alloc] init];
++	[windows addObject: syntheticWindowInfo(1201, getpid(), appName, appName, 0, fullScreen)];
++	[windows addObject: syntheticWindowInfo(1202, 301, @"Finder", @"Desktop", -2147483623, fullScreen)];
++	[windows addObject: syntheticWindowInfo(1203, 300, @"Dock", @"Dock", 20, dock)];
++	[windows addObject: syntheticWindowInfo(1204, 302, @"SystemUIServer", @"SystemUIServer", 25, menuBar)];
++	return windows;
++}
++
 +// Windows of every client of the display server, front to back. The option and the reference
 +// window select the same subsets as on macOS.
 +CFArrayRef __nullable CGWindowListCopyWindowInfo(CGWindowListOption option, CGWindowID relativeToWindow)
@@ -7397,6 +7442,14 @@ index e1da261d..f050b6e8 100644
 +	}
 +
 +	[all release];
++
++	if ([selected count] == 0)
++	{
++		NSArray* fallback = syntheticWindowList();
++		[selected release];
++		return (CFArrayRef) fallback;
++	}
++
 +	return (CFArrayRef) selected;
 +}
 +
